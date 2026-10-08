@@ -2,7 +2,9 @@
 
 Pipeline (mirrors hloc's `match_dense` workflow, with RoMaV2 as the dense matcher):
 
-    images -> pairs.txt -> RoMaV2 dense matches per pair (raw_matches/*.npz)
+    images -> pairs.txt (ARKit-pose-guided: rotation pre-filter + nearest camera centers, top-20 per image;
+              NetVLAD retrieval is skipped whenever poses are available)
+           -> RoMaV2 dense matches per pair (raw_matches/*.npz)
            -> hloc quantize/aggregate into per-image keypoints + matches0 (feats.h5 / matches.h5)
            -> pycolmap: database, geometric verification, mapping / triangulation
            -> <output_dir>/{cameras,images,points3D,frames,rigs}.bin
@@ -102,6 +104,54 @@ def pairs_sequential(
     return [(names[i], names[j]) for i, j in sorted(pairs)]
 
 
+def pairs_pose_guided(
+    names: list[str],
+    poses: dict[str, np.ndarray],
+    num_pairs: int,
+    max_rot_deg: float,
+    min_dist: float = 0.0,
+) -> list[tuple[str, str]]:
+    """Prior-pose-guided pair selection (replaces NetVLAD retrieval when ARKit poses are available).
+
+    For every query image: (1) coarse filter, keep candidates whose relative rotation (geodesic angle between
+    the cam_from_world rotations) is at most `max_rot_deg`; (2) rank the surviving pool by camera-center distance
+    (ascending) and keep the top `num_pairs`. Only extrinsics are used, no image content, so repeated or
+    low-texture appearance cannot produce geometrically inconsistent pairs, and no global descriptor is extracted.
+    The angle of R_i R_j^T does not depend on the camera axis convention, so ARKit/COLMAP conventions both work.
+    """
+    n = len(names)
+    if n < 2:
+        return []
+    rotations = np.stack([poses[name][:3, :3] for name in names])
+    centers = np.stack([-poses[name][:3, :3].T @ poses[name][:3, 3] for name in names])
+
+    # trace(R_i R_j^T) = <R_i, R_j>_F
+    cos = (np.einsum("iab,jab->ij", rotations, rotations) - 1.0) / 2.0
+    rot_deg = np.degrees(np.arccos(np.clip(cos, -1.0, 1.0)))
+    dist = np.linalg.norm(centers[:, None, :] - centers[None, :, :], axis=-1)
+
+    k = min(num_pairs, n - 1)
+    pairs: list[tuple[str, str]] = []
+    num_fallback = 0
+    for i in range(n):
+        others = np.arange(n) != i
+        pool = np.flatnonzero(others & (rot_deg[i] <= max_rot_deg) & (dist[i] >= min_dist))
+        if pool.size:
+            chosen = pool[np.argsort(dist[i, pool], kind="stable")[:k]]
+        else:
+            # nothing passes the filters: link the image to its most similarly oriented frames so it is not isolated
+            candidates = np.flatnonzero(others)
+            chosen = candidates[np.argsort(rot_deg[i, candidates], kind="stable")[:k]]
+            num_fallback += 1
+        pairs.extend((names[i], names[int(j)]) for j in chosen)
+    if num_fallback:
+        logger.warning(
+            f"pose-guided pairs: {num_fallback} images had no candidate within {max_rot_deg} deg / "
+            f">= {min_dist} m, linked to their {k} closest orientations instead"
+        )
+    return pairs
+
+
 def pairs_retrieval(
     args, names: list[str], image_dir: Path, out_dir: Path
 ) -> list[tuple[str, str]]:
@@ -113,7 +163,7 @@ def pairs_retrieval(
     )
     tmp = out_dir / "pairs-retrieval.txt"
     pairs_from_retrieval.main(
-        global_feats, tmp, num_matched=min(args.num_retrieval, len(names) - 1)
+        global_feats, tmp, num_matched=min(args.num_pairs, len(names) - 1)
     )
     return read_pairs(tmp)
 
@@ -132,8 +182,12 @@ def write_pairs(path: Path, pairs: list[tuple[str, str]]) -> None:
     path.write_text("\n".join(f"{a} {b}" for a, b in pairs))
 
 
-def build_pairs(args, names, image_dir, out_dir) -> list[tuple[str, str]]:
-    if args.pairs_mode == "exhaustive":
+def build_pairs(args, names, image_dir, out_dir, poses=None) -> list[tuple[str, str]]:
+    if args.pairs_mode == "pose":
+        if poses is None:
+            raise SystemExit("--pairs_mode pose requires camera poses (--poses_path)")
+        pairs = pairs_pose_guided(names, poses, args.num_pairs, args.pose_max_rot_deg, args.pose_min_dist)
+    elif args.pairs_mode == "exhaustive":
         pairs = pairs_exhaustive(names)
     elif args.pairs_mode == "sequential":
         pairs = pairs_sequential(names, args.window, args.loop)
@@ -516,13 +570,21 @@ def main():
                    help="Hierarchical-Localization checkout (default: $HLOC_DIR or third_party/Hierarchical-Localization)")
 
     g = parser.add_argument_group("pairs")
-    g.add_argument("--pairs_mode", default="auto", choices=["auto", "exhaustive", "sequential", "retrieval", "file"],
-                   help="auto: file if --pairs_file is given, else exhaustive up to --max_exhaustive images, else retrieval")
+    g.add_argument("--pairs_mode", default="auto",
+                   choices=["auto", "pose", "exhaustive", "sequential", "retrieval", "file"],
+                   help="pose: prior-pose-guided pairs (rotation pre-filter, then nearest camera centers; needs poses, "
+                        "skips global-descriptor retrieval). retrieval: global-descriptor retrieval. "
+                        "auto: file if --pairs_file is given, else pose if camera poses are available, else exhaustive "
+                        "up to --max_exhaustive images, else retrieval")
+    g.add_argument("--num_pairs", type=int, default=20, help="pose / retrieval: top-K pairs kept per query image")
+    g.add_argument("--pose_max_rot_deg", type=float, default=45.0,
+                   help="pose: coarse filter, max relative rotation (deg) between a query and its candidates")
+    g.add_argument("--pose_min_dist", type=float, default=0.0,
+                   help="pose: min camera-center distance (m) of a candidate, 0 = disabled")
     g.add_argument("--max_exhaustive", type=int, default=80, help="auto: largest image count matched exhaustively")
     g.add_argument("--window", type=int, default=10, help="sequential: match each image with the next N")
     g.add_argument("--loop", action="store_true", help="sequential: wrap around (closed trajectories)")
     g.add_argument("--retrieval_model", default="netvlad", choices=["netvlad", "openibl", "megaloc"])
-    g.add_argument("--num_retrieval", type=int, default=20)
     g.add_argument("--pairs_file", type=Path, default=None)
 
     g = parser.add_argument_group("RoMaV2")
@@ -592,13 +654,16 @@ def main():
 
     names = list_images(image_dir)
     logger.info(f"{len(names)} images in {image_dir}")
+    poses = load_prior_poses(poses_path, names) if poses_path else None
     if args.pairs_mode == "auto":
         if args.pairs_file:
             args.pairs_mode = "file"
+        elif poses is not None:
+            args.pairs_mode = "pose"
         else:
             args.pairs_mode = "exhaustive" if len(names) <= args.max_exhaustive else "retrieval"
         logger.info(f"pairs_mode=auto -> {args.pairs_mode}")
-    pairs = build_pairs(args, names, image_dir, cache)
+    pairs = build_pairs(args, names, image_dir, cache, poses)
     if not pairs:
         raise SystemExit("no image pairs")
     write_pairs(pairs_path, pairs)
@@ -648,7 +713,6 @@ def main():
         }
         logger.info(f"fixed intrinsics fx,fy,cx,cy = {intrinsics}")
 
-    poses = load_prior_poses(poses_path, names) if poses_path else None
     if poses is not None and args.pose_mode is None:
         args.pose_mode = "triangulate_ba" if intrinsics is not None else "position_prior"
     if poses is not None:
