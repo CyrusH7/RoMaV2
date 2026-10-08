@@ -29,6 +29,13 @@ eval = [
     "wandb>=0.23.0",
     "wxbs-benchmark>=0.0.4",
 ]
+sfm = [
+    "h5py",
+    "opencv-python-headless",
+    "pycolmap>=3.13.0",
+    "pyyaml",
+    "scipy",
+]
 dev = [
     "slurm-util>=0.2.7",
     "ruff>=0.14.5",

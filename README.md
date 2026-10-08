@@ -100,6 +100,34 @@ or
 uv add romav2[fused-local-corr]
 ```
 
+## Structure-from-Motion (COLMAP)
+`sfm/` runs RoMaV2 dense matching through [hloc](https://github.com/cvg/Hierarchical-Localization) and COLMAP, optionally with ARKit / Stray Scanner intrinsics and poses.
+```bash
+uv pip install -e ".[sfm]"
+git clone --depth 1 https://github.com/cvg/Hierarchical-Localization.git third_party/Hierarchical-Localization
+```
+1. Convert Stray Scanner `camera_matrix.csv` / `odometry.csv` into `intrinsics.yaml` / `camera_poses.yaml` (skip for images only):
+```bash
+python sfm/camera_processor.py \
+    --camera-matrix local/example/camera_matrix.csv \
+    --odometry local/example/odometry.csv \
+    --images-dir local/example/images \
+    --output-dir local/example
+```
+2. Reconstruct:
+```bash
+python sfm/reconstruct.py \
+    --data_dir local/example \
+    --intrinsics_path local/example/intrinsics.yaml \
+    --poses_path local/example/camera_poses.yaml \
+    --images_dir local/example/images \
+    --cache_dir local/example/cache_dir
+```
+`--data_dir` hosts everything that is not given explicitly (`images/`, `intrinsics.yaml`, `camera_poses.yaml`, `cache_dir/`).
+The result is only the COLMAP binaries in `<data_dir>/sparse/0` (`--output_dir`); all intermediates (RoMaV2 raw matches in `raw_matches/`, pairs, hloc features/matches, COLMAP database) stay in `--cache_dir`, so re-runs reuse the dense matches.
+With intrinsics and poses the poses are triangulated and then refined by a global BA (`--pose_mode triangulate_ba`, default); with intrinsics only they are estimated by COLMAP; with neither, plain incremental SfM runs.
+`python sfm/compare_models.py` compares several `sparse/0` models against the ARKit poses.
+
 ## Settings
 By twiddling with some different settings you may reach better results on your task of interest.
 Some important ones, which we enable setting to some reasonable defaults through `model.apply_setting`, are:

@@ -4,3 +4,7 @@ __pycache__/
 *.pt
 wandb/
 uv.lock
+outputs/
+local/
+third_party/
+*.tar

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from collections import OrderedDict
@@ -95,10 +96,19 @@ class RoMaV2(nn.Module):
             # default
             cfg = RoMaV2.Cfg()
             
-        weights = torch.hub.load_state_dict_from_url(
-            "https://github.com/Parskatt/RoMaV2/releases/download/v2.0.1/romav2.0.1.pt",
-            map_location=device
+        local_ckpt = Path(
+            os.environ.get(
+                "ROMAV2_CKPT",
+                Path(__file__).resolve().parents[2] / "ckpt" / "romav2.0.1.pt",
+            )
         )
+        if local_ckpt.is_file():
+            weights = torch.load(local_ckpt, map_location=device)
+        else:
+            weights = torch.hub.load_state_dict_from_url(
+                "https://github.com/Parskatt/RoMaV2/releases/download/v2.0.1/romav2.0.1.pt",
+                map_location=device,
+            )
         self.f = Descriptor(cfg.descriptor)
         self.matcher = Matcher(cfg.matcher)
         self.cfg = cfg
