@@ -115,7 +115,7 @@ def local_correlation(
         .expand(1, 2 * r + 1, 2 * r + 1, 2)
         .reshape(1, K, 2)
     )
-    if local_corr is None:
+    if local_corr is None or device.type != "cuda":
         corr = native_torch_local_corr(
             feature0,
             feature1,

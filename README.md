@@ -132,3 +132,69 @@ If you find our models useful, please consider citing our paper!
   year={2025}
 }
 ```
+
+## RoMaV2 + COLMAP SfM (experimental)
+
+An optional pipeline in `romav2.sfm` matches image pairs with RoMaV2, merges
+pairwise observations into shared per-image keypoints, writes a COLMAP database,
+performs geometric verification, removes verified match edges that would create
+tracks with multiple observations in one image, and runs COLMAP's incremental
+mapper and bundle adjustment. This is the **image-only baseline**: it does not yet read pose or
+depth priors, perform pose-guided pair selection or prior-guided refinement, or
+recover metric scale. A monocular reconstruction is defined only up to similarity.
+
+Install the optional backend in the existing environment:
+
+```bash
+conda activate romav2
+uv pip install -e '.[sfm]'
+```
+
+Run on a small image collection (the output directory must be empty):
+
+```bash
+python -m romav2.sfm --images /path/to/images --output /path/to/new-output \
+    --setting fast
+```
+
+By default all image pairs are matched, so cost grows quadratically. For larger
+collections provide `--pairs /path/to/pairs.txt`: each line contains two image
+paths relative to `--images`, separated by whitespace. Reversed duplicates are
+ignored. Image names must not contain whitespace. This file is the integration
+point for a future pose-based pair selector. Use `--image-glob` to filter input,
+e.g. `--image-glob '**/*.color.png'` to exclude depth PNGs in 7-Scenes.
+
+For a shared calibrated PINHOLE camera, supply original-image pixel intrinsics:
+
+```bash
+python -m romav2.sfm --images /path/to/images --output /path/to/new-output \
+    --camera-params FX FY CX CY --fix-intrinsics
+```
+
+All selected images must have the same size for this shared camera. Without
+`--fix-intrinsics`, COLMAP may optimize focal length and distortion where
+applicable. Without `--camera-params`, COLMAP initializes cameras from image
+metadata or its default heuristic. Images should be undistorted if using the
+PINHOLE model. COLMAP pixel coordinates place the first pixel center at (0.5,
+0.5). After geometric verification, conflict filtering prefers higher-confidence matches;
+`summary.json` records the number of rejected conflicting edges.
+`--cell-size` (default 1 pixel) controls observation merging: increasing
+it can create more tracks but may merge distinct features and degrade accuracy.
+
+Outputs are `database.db`, `pairs.txt`, `summary.json`, and COLMAP binary models
+under `sparse/<model-id>/`. There may be multiple disconnected models; inspect
+`summary.json` for registered-image and point counts. No-model runs fail with a
+nonzero exit code. PyCOLMAP 3.13 is required for this integration. The first
+RoMaV2 run downloads model weights and DINOv3 code, and GPU execution has to be
+validated with the installed PyTorch/CUDA build and available hardware. CPU
+sampling and local correlation are supported, but full CPU model inference can be
+very slow. Pairs with no valid correspondences are skipped by COLMAP; sampling
+returns at most the number of available valid correspondences. See
+`python -m romav2.sfm --help` for all options.
+
+For a CPU-only diagnostic of the COLMAP backend on 7-Scenes color frames, install
+`opencv-python-headless` and run `python scripts/check_colmap_sift.py --images
+/path/to/seq --output /path/to/new-output`. This uses SIFT, not RoMaV2, and does
+not validate the learned matcher. 7-Scenes RGB calibration is approximate; use
+appropriate RGB intrinsics for the data and intended evaluation rather than
+assuming that the dataset's depth-camera calibration applies to RGB.

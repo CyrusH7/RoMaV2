@@ -370,6 +370,8 @@ class RoMaV2(nn.Module):
         return preds
 
     def sample(self, preds: dict[str, torch.Tensor], num_corresp: int):
+        if num_corresp < 0:
+            raise ValueError("num_corresp must be non-negative")
         warp = preds["warp_AB"]
         confidence_AB = preds["overlap_AB"]
         precision_AB = preds["precision_AB"] if "precision_AB" in preds else None
@@ -426,12 +428,17 @@ class RoMaV2(nn.Module):
         else:
             matches = matches_AB
             confidence = confidence_AB.reshape(-1)
-            precision = precision_AB.reshape(-1, 2, 2)
+            precision = precision_AB.reshape(-1, 2, 2) if precision_AB is not None else None
 
         expansion_factor = 4
-        confidence = confidence * matches.abs().amax(dim=-1).le(1 - 1 / H_A).float()
+        valid = (torch.isfinite(matches).all(dim=-1) & torch.isfinite(confidence)
+                 & (confidence > 0) & matches.abs().amax(dim=-1).le(1 - 1 / H_A))
+        confidence = torch.where(valid, confidence, torch.zeros_like(confidence))
+        count = min(expansion_factor * num_corresp, int(valid.sum().item()))
+        if count == 0:
+            return matches[:0], confidence[:0], None, None
         corresp_inds = torch.multinomial(
-            confidence, expansion_factor * num_corresp, replacement=False
+            confidence, count, replacement=False
         )
         sampled_matches = matches[corresp_inds]
         sampled_confidence = confidence[corresp_inds]
@@ -442,7 +449,7 @@ class RoMaV2(nn.Module):
         # return sampled_matches, sampled_confidence
         density = kde(sampled_matches)
 
-        p = 1 / (density + 1)
+        p = 1 / (density.float() + 1)
         p[density < 10] = (
             1e-7  # Basically should have at least 10 perfect neighbours, or around 100 ok ones
         )
@@ -525,8 +532,12 @@ class RoMaV2(nn.Module):
 
 def kde(x: torch.Tensor, std: float = 0.1, half: bool = True) -> torch.Tensor:
     # use a gaussian kernel to estimate density
-    if half:
+    if half and x.device.type == "cuda":
         x = x.half()
-    scores = (-(torch.cdist(x, x) ** 2) / (2 * std**2)).exp()
-    density = scores.sum(dim=-1)
-    return density
+    else:
+        x = x.float()
+    # A full NxN distance matrix can exhaust GPU/CPU memory for 5000 matches.
+    return torch.cat([
+        (-(torch.cdist(chunk, x) ** 2) / (2 * std**2)).exp().sum(dim=-1, dtype=torch.float32)
+        for chunk in x.split(512)
+    ])
