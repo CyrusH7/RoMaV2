@@ -1,0 +1,8 @@
+{
+  "model": "PINHOLE",
+  "width": 640,
+  "height": 480,
+  "params": [532.57, 531.54, 320.0, 240.0],
+  "source": "user_provided",
+  "description": "Office RGB intrinsics supplied by the user; coordinates use original 640x480 image pixels."
+}

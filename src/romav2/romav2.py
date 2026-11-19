@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+import logging
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
-from collections import OrderedDict
-
 
 import numpy as np
 import torch
@@ -11,20 +11,19 @@ import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
 
-import logging
 from romav2.device import device
 from romav2.features import Descriptor, FineFeatures
 from romav2.geometry import (
-    bhwc_grid_sample,
     bhwc_interpolate,
-    get_normalized_grid,
     prec_mat_from_prec_params,
     to_pixel,
 )
 from romav2.io import check_not_i16
 from romav2.matcher import Matcher
 from romav2.refiner import Refiners
-from romav2.types import Setting, ImageLike
+from romav2.sampling import kde as kde
+from romav2.sampling import sample_predictions
+from romav2.types import ImageLike, Setting
 
 logger = logging.getLogger(__name__)
 
@@ -370,102 +369,7 @@ class RoMaV2(nn.Module):
         return preds
 
     def sample(self, preds: dict[str, torch.Tensor], num_corresp: int):
-        if num_corresp < 0:
-            raise ValueError("num_corresp must be non-negative")
-        warp = preds["warp_AB"]
-        confidence_AB = preds["overlap_AB"]
-        precision_AB = preds["precision_AB"] if "precision_AB" in preds else None
-
-        warp = warp[0]
-        confidence_AB = confidence_AB[0].reshape(-1)
-        if precision_AB is not None:
-            precision_AB = precision_AB[0]
-
-        H_A, W_A, two = warp.shape
-        grid = get_normalized_grid(1, H_A, W_A)[0]
-        matches_AB = torch.cat((grid, warp), dim=-1).reshape(-1, 4)
-        if self.bidirectional:
-            confidence_BA = preds["overlap_BA"]
-            warp_BA = preds["warp_BA"]
-
-            precision_BA = (
-                preds["precision_BA"] if "precision_BA" in preds else None
-            )
-            warp_BA = warp_BA[0]
-            confidence_BA = confidence_BA[0]
-            if precision_BA is not None:
-                precision_BA = precision_BA[0]
-
-            if precision_BA is not None and precision_AB is not None:
-                precision_A = bhwc_grid_sample(
-                    precision_BA[None].reshape(1, H_A, W_A, -1),
-                    warp[None],
-                    mode="bilinear",
-                    align_corners=False,
-                ).reshape(H_A, W_A, 2, 2)
-                precision_B = bhwc_grid_sample(
-                    precision_AB[None].reshape(1, H_A, W_A, -1),
-                    warp_BA[None],
-                    mode="bilinear",
-                    align_corners=False,
-                ).reshape(H_A, W_A, 2, 2)
-                precision_fwd = torch.stack(
-                    (precision_A, precision_AB), dim=-3
-                ).reshape(-1, 2, 2, 2)
-                precision_bwd = torch.stack(
-                    (precision_BA, precision_B), dim=-3
-                ).reshape(-1, 2, 2, 2)
-                precision = torch.cat((precision_fwd, precision_bwd), dim=0)
-            else:
-                precision = None
-            # let's hope H_A is equal to H_B
-            grid = get_normalized_grid(1, H_A, W_A)[0]
-            matches_BA = torch.cat((warp_BA, grid), dim=-1).reshape(-1, 4)
-            confidence = torch.cat(
-                (confidence_AB.reshape(-1), confidence_BA.reshape(-1)), dim=0
-            )
-            matches = torch.cat((matches_AB, matches_BA), dim=0)
-        else:
-            matches = matches_AB
-            confidence = confidence_AB.reshape(-1)
-            precision = precision_AB.reshape(-1, 2, 2) if precision_AB is not None else None
-
-        expansion_factor = 4
-        valid = (torch.isfinite(matches).all(dim=-1) & torch.isfinite(confidence)
-                 & (confidence > 0) & matches.abs().amax(dim=-1).le(1 - 1 / H_A))
-        confidence = torch.where(valid, confidence, torch.zeros_like(confidence))
-        count = min(expansion_factor * num_corresp, int(valid.sum().item()))
-        if count == 0:
-            return matches[:0], confidence[:0], None, None
-        corresp_inds = torch.multinomial(
-            confidence, count, replacement=False
-        )
-        sampled_matches = matches[corresp_inds]
-        sampled_confidence = confidence[corresp_inds]
-        if precision is not None:
-            sampled_precision = precision[corresp_inds]
-        else:
-            sampled_precision = None
-        # return sampled_matches, sampled_confidence
-        density = kde(sampled_matches)
-
-        p = 1 / (density.float() + 1)
-        p[density < 10] = (
-            1e-7  # Basically should have at least 10 perfect neighbours, or around 100 ok ones
-        )
-        balanced_samples = torch.multinomial(
-            p, num_samples=min(num_corresp, len(sampled_confidence)), replacement=False
-        )
-        return (
-            sampled_matches[balanced_samples],
-            sampled_confidence[balanced_samples],
-            sampled_precision[balanced_samples][:, 0]
-            if sampled_precision is not None
-            else None,
-            sampled_precision[balanced_samples][:, 1]
-            if sampled_precision is not None
-            else None,
-        )
+        return sample_predictions(preds, num_corresp, bidirectional=self.bidirectional)
 
     @classmethod
     def prec_map_coordinates(
@@ -528,16 +432,3 @@ class RoMaV2(nn.Module):
                 return torch.cat((inds_A, inds_B), dim=-1)
             else:
                 return torch.cat((x_A[inds_A], x_B[inds_B]), dim=-1)
-
-
-def kde(x: torch.Tensor, std: float = 0.1, half: bool = True) -> torch.Tensor:
-    # use a gaussian kernel to estimate density
-    if half and x.device.type == "cuda":
-        x = x.half()
-    else:
-        x = x.float()
-    # A full NxN distance matrix can exhaust GPU/CPU memory for 5000 matches.
-    return torch.cat([
-        (-(torch.cdist(chunk, x) ** 2) / (2 * std**2)).exp().sum(dim=-1, dtype=torch.float32)
-        for chunk in x.split(512)
-    ])

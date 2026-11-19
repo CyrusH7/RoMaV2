@@ -139,9 +139,9 @@ An optional pipeline in `romav2.sfm` matches image pairs with RoMaV2, merges
 pairwise observations into shared per-image keypoints, writes a COLMAP database,
 performs geometric verification, removes verified match edges that would create
 tracks with multiple observations in one image, and runs COLMAP's incremental
-mapper and bundle adjustment. This is the **image-only baseline**: it does not yet read pose or
-depth priors, perform pose-guided pair selection or prior-guided refinement, or
-recover metric scale. A monocular reconstruction is defined only up to similarity.
+mapper and bundle adjustment. The default run is an **image-only baseline**, defined only up to similarity.
+Optional intrinsics and pose priors are available as described below; depth
+priors and pose-guided pair selection are not enabled by this pipeline.
 
 Install the optional backend in the existing environment:
 
@@ -178,8 +178,10 @@ metadata or its default heuristic. Images should be undistorted if using the
 PINHOLE model. COLMAP pixel coordinates place the first pixel center at (0.5,
 0.5). After geometric verification, conflict filtering prefers higher-confidence matches;
 `summary.json` records the number of rejected conflicting edges.
-`--cell-size` (default 1 pixel) controls observation merging: increasing
+`--cell-size` (default 1 pixel) controls observation association: increasing
 it can create more tracks but may merge distinct features and degrade accuracy.
+Associated observations use confidence-weighted subpixel coordinates. Per-pair
+mutual-best filtering and optional `--min-match-score` remove ambiguous matches.
 
 Outputs are `database.db`, `pairs.txt`, `summary.json`, and COLMAP binary models
 under `sparse/<model-id>/`. There may be multiple disconnected models; inspect
@@ -195,6 +197,36 @@ returns at most the number of available valid correspondences. See
 For a CPU-only diagnostic of the COLMAP backend on 7-Scenes color frames, install
 `opencv-python-headless` and run `python scripts/check_colmap_sift.py --images
 /path/to/seq --output /path/to/new-output`. This uses SIFT, not RoMaV2, and does
-not validate the learned matcher. 7-Scenes RGB calibration is approximate; use
-appropriate RGB intrinsics for the data and intended evaluation rather than
-assuming that the dataset's depth-camera calibration applies to RGB.
+not validate the learned matcher. For Office RGB use the user-provided calibration JSON described below;
+the dataset's depth-camera calibration must not be substituted for RGB calibration.
+
+### Initialize from full camera poses
+
+Supply per-image OpenCV camera-to-world poses in meters and calibrated PINHOLE
+intrinsics. The backend verifies matches against the supplied relative poses,
+triangulates the accepted tracks in the prior coordinate system, and refines
+the poses and structure with soft constraints.
+
+```bash
+python -m romav2.sfm --images /path/to/images --output /path/to/new-output \
+    --pairs /path/to/pairs.txt --priors /path/to/priors.json \
+    --intrinsics-prior --fix-intrinsics --init-from-poses
+```
+
+To include this strategy in the 100-frame Office ablation with zero injected noise:
+
+```bash
+PRIOR_NOISE_M=0 PRIOR_NOISE_DEG=0 PRIOR_INIT_CONTROL=1 bash scripts/quick_test_priors.sh
+```
+
+### Intrinsics/extrinsics priors and 100-frame quick ablation
+
+Run `bash scripts/quick_test_priors.sh` in the activated `romav2` environment after
+allocating a GPU. The script reads `data/7-scenes/office/seq-01.zip`, selects 100
+frames, and compares baseline / intrinsics / extrinsics / both with identical
+pairs and cached RoMaV2 matches. Results go to `runs/office_prior_ablation_*/`.
+Office intrinsics default to the user-provided `[532.57, 531.54, 320, 240]`
+at 640x480, stored in `src/romav2/sfm/configs/office.json`.
+
+Run the CPU regression
+suite with `python -m pytest tests/sfm` (install `.[sfm,test]` for its dependencies).

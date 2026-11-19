@@ -1,0 +1,10 @@
+{
+  "source": "https://github.com/zinsmatt/7-Scenes-Calibration/blob/master/check_calibration.py",
+  "units": "meters",
+  "depth_from_rgb": [
+    [1, 0, 0, 0.0234490289],
+    [0, 1, 0, 0.00617665950],
+    [0, 0, 1, 0.0105253125],
+    [0, 0, 0, 1]
+  ]
+}
