@@ -4,7 +4,7 @@ import argparse
 import logging
 from pathlib import Path
 
-from .pairs import discover_images, exhaustive_pairs, read_pairs
+from .pairs import DEFAULT_POSE_TOP_K, discover_images, exhaustive_pairs, read_pairs
 
 
 def main():
@@ -20,10 +20,19 @@ def main():
     parser.add_argument(
         "--image-glob", default="**/*", help="Image selection glob relative to --images"
     )
-    parser.add_argument(
+    pair_source = parser.add_mutually_exclusive_group()
+    pair_source.add_argument(
         "--pairs",
         type=Path,
         help="Pairs file: one image name pair per line; default is exhaustive",
+    )
+    pair_source.add_argument(
+        "--pose-select",
+        nargs="?",
+        const=DEFAULT_POSE_TOP_K,
+        type=int,
+        metavar="K",
+        help="Use RGB pose priors to select K neighbors per image (default K=20)",
     )
     parser.add_argument(
         "--setting", choices=["turbo", "fast", "base", "precise"], default="fast"
@@ -105,14 +114,18 @@ def main():
         or args.pose_prior
         or args.fix_poses
         or args.init_from_poses
+        or args.pose_select is not None
     ) and args.priors is None:
         parser.error("Prior flags require --priors")
+    if args.pose_select is not None and args.pose_select < 1:
+        parser.error("--pose-select requires a positive K")
     if args.prior_iterations < 1 or args.num_threads < 1:
         parser.error("Prior iterations and thread count must be positive")
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     names = discover_images(args.images, args.image_glob)
-    pairs = read_pairs(args.pairs, names) if args.pairs else exhaustive_pairs(names)
-    logging.info("Selected %d images and %d pairs", len(names), len(pairs))
+    pairs = None
+    if args.pose_select is None:
+        pairs = read_pairs(args.pairs, names) if args.pairs else exhaustive_pairs(names)
     from .colmap import reconstruct
     from .matching import RomaMatcher
     from .priors import load_priors
@@ -139,6 +152,7 @@ def main():
         fix_intrinsics=args.fix_intrinsics,
         seed=args.seed,
         priors=priors,
+        pose_select_k=args.pose_select,
         use_intrinsics_prior=args.intrinsics_prior,
         use_pose_prior=args.pose_prior,
         fix_poses=args.fix_poses,

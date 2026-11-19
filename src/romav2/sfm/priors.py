@@ -13,6 +13,8 @@ import pycolmap
 from scipy.optimize import least_squares
 from scipy.spatial.transform import Rotation
 
+from .calibration import validate_camera_to_world
+
 
 @dataclass
 class Priors:
@@ -49,16 +51,7 @@ def load_priors(path, names):
                 raise ValueError(f"Invalid fx fy cx cy for {name}")
             cameras[name] = k
         if "camera_to_world" in entry:
-            t = np.asarray(entry["camera_to_world"], dtype=float)
-            if (
-                t.shape != (4, 4)
-                or not np.isfinite(t).all()
-                or not np.allclose(t[3], [0, 0, 0, 1], atol=1e-6)
-                or not np.allclose(t[:3, :3].T @ t[:3, :3], np.eye(3), atol=1e-4)
-                or not np.isclose(np.linalg.det(t[:3, :3]), 1, atol=1e-4)
-            ):
-                raise ValueError(f"Invalid rigid camera-to-world transform for {name}")
-            poses[name] = t
+            poses[name] = validate_camera_to_world(entry["camera_to_world"], name)
     position_sigma = float(data.get("position_sigma", 0.05))
     rotation_sigma = float(data.get("rotation_sigma_deg", 3.0))
     if not all(np.isfinite(x) and x > 0 for x in (position_sigma, rotation_sigma)):

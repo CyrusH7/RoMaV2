@@ -30,6 +30,19 @@ class Calibration:
         return asdict(self)
 
 
+def validate_camera_to_world(matrix, name):
+    t = np.asarray(matrix, dtype=float)
+    if (
+        t.shape != (4, 4)
+        or not np.isfinite(t).all()
+        or not np.allclose(t[3], [0, 0, 0, 1], atol=1e-6)
+        or not np.allclose(t[:3, :3].T @ t[:3, :3], np.eye(3), atol=1e-4)
+        or not np.isclose(np.linalg.det(t[:3, :3]), 1, atol=1e-4)
+    ):
+        raise ValueError(f"Invalid rigid camera-to-world transform for {name}")
+    return t
+
+
 def validate_pinhole(params):
     values = np.asarray(params, dtype=float)
     if values.shape != (4,) or not np.isfinite(values).all() or np.any(values[:2] <= 0):

@@ -14,6 +14,12 @@ from scipy.spatial.transform import Rotation
 
 from .calibration import OFFICE_CALIBRATION, load_calibration, validate_pinhole
 from .io import RunRecord, write_json
+from .pairs import (
+    DEFAULT_POSE_TOP_K,
+    normalize_pairs,
+    pairs_from_poses,
+    validate_pose_top_k,
+)
 
 ARMS = ["baseline", "intrinsics", "extrinsics", "both"]
 
@@ -41,8 +47,13 @@ def read_depth_from_rgb(path):
 
 
 def prepare(args):
-    if args.count < 3 or args.window < 1:
-        raise ValueError("Need at least three frames and a positive pairing window")
+    if args.count < 3:
+        raise ValueError("Need at least three frames")
+    top_k = getattr(args, "pose_select", None)
+    if top_k is not None:
+        top_k = validate_pose_top_k(top_k)
+    elif args.window < 1:
+        raise ValueError("Need a positive pairing window")
     if not all(
         np.isfinite(x)
         for x in (
@@ -127,16 +138,20 @@ def prepare(args):
                 "intrinsics": args.intrinsics,
             }
         names = sorted(prior)
-        pairs = [
-            (names[i], names[j])
-            for i in range(len(names))
-            for j in range(i + 1, min(len(names), i + args.window + 1))
-        ]
-        pairs += [
-            (names[i], names[i + 2 * args.window])
-            for i in range(len(names) - 2 * args.window)
-        ]
-        pairs = sorted(set(pairs))
+        if top_k is not None:
+            poses = {name: prior[name]["camera_to_world"] for name in names}
+            pairs = normalize_pairs(pairs_from_poses(names, poses, top_k), names)
+        else:
+            pairs = [
+                (names[i], names[j])
+                for i in range(len(names))
+                for j in range(i + 1, min(len(names), i + args.window + 1))
+            ]
+            pairs += [
+                (names[i], names[i + 2 * args.window])
+                for i in range(len(names) - 2 * args.window)
+            ]
+            pairs = sorted(set(pairs))
         (args.output / "pairs.txt").write_text("".join(f"{a} {b}\n" for a, b in pairs))
         common = {
             "pose_convention": "camera_to_world_opencv",
@@ -162,6 +177,8 @@ def prepare(args):
             {
                 "images": names,
                 "pairs": len(pairs),
+                "pair_mode": "temporal" if top_k is None else "pose-select",
+                "pose_select": top_k,
                 "calibration": calibration.as_dict(),
                 "calibration_note": "User-provided RGB calibration; provenance recorded, not independently re-calibrated.",
                 "prior_note": "Reference-derived synthetic noisy priors, not independent ARKit measurements.",
@@ -433,7 +450,11 @@ def main():
     prep.add_argument("--sequence", default="seq-01")
     prep.add_argument("--output", type=Path, required=True)
     prep.add_argument("--count", type=int, default=100)
-    prep.add_argument("--window", type=int, default=5)
+    pairing = prep.add_mutually_exclusive_group()
+    pairing.add_argument("--window", type=int, default=5)
+    pairing.add_argument(
+        "--pose-select", nargs="?", const=DEFAULT_POSE_TOP_K, type=int, metavar="K"
+    )
     prep.add_argument("--seed", type=int, default=0)
     prep.add_argument("--noise-m", type=float, default=0.02)
     prep.add_argument("--noise-deg", type=float, default=2.0)

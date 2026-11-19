@@ -17,11 +17,16 @@ if [[ -v FX || -v FY || -v CX || -v CY ]]; then
   : "${CY:?Set all of FX,FY,CX,CY to override calibration}"
   calibration_flags+=(--intrinsics "$FX" "$FY" "$CX" "$CY")
 fi
+case "${PAIR_MODE:-temporal}" in
+  temporal) pair_flags=(--window "${PAIR_WINDOW:-5}") ;;
+  pose-select) pair_flags=(--pose-select "${PAIR_TOP_K:-20}") ;;
+  *) echo "PAIR_MODE must be temporal or pose-select" >&2; exit 2 ;;
+esac
 export OMP_NUM_THREADS="$THREADS"
 export OPENBLAS_NUM_THREADS="$THREADS"
 "$PYTHON_BIN" -m romav2.sfm.ablation prepare --dataset "$DATASET" \
   --sequence "${SEQUENCE:-seq-01}" --output "$RUN_DIR" --count "$COUNT" \
-  --window "${PAIR_WINDOW:-5}" --seed "${SEED:-0}" \
+  "${pair_flags[@]}" --seed "${SEED:-0}" \
   --noise-m "${PRIOR_NOISE_M:-0.02}" --noise-deg "${PRIOR_NOISE_DEG:-2}" \
   --position-sigma "${POSITION_SIGMA:-0.05}" --rotation-sigma-deg "${ROTATION_SIGMA_DEG:-3}" \
   "${calibration_flags[@]}"

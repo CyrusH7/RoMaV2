@@ -1,3 +1,5 @@
+import json
+import sqlite3
 from itertools import combinations
 
 import numpy as np
@@ -7,7 +9,8 @@ from PIL import Image
 
 from romav2.sfm.colmap import reconstruct
 from romav2.sfm.matching import FeatureStore
-from romav2.sfm.pairs import read_pairs
+from romav2.sfm.pairs import normalize_pairs, pairs_from_poses, read_pairs
+from romav2.sfm.priors import Priors
 
 
 def test_pairs_dedup_and_validation(tmp_path):
@@ -43,7 +46,8 @@ def test_merge_observations_and_keep_best():
     assert np.allclose(store.keypoints("b"), [[50.1, 60.1]])
 
 
-def test_colmap_reconstructs_shared_tracks(tmp_path):
+@pytest.mark.parametrize("pose_select_k", [None, np.int64(3)])
+def test_colmap_reconstructs_shared_tracks(tmp_path, pose_select_k):
     images = tmp_path / "images"
     images.mkdir()
     names = [f"{i:03}.png" for i in range(5)]
@@ -57,9 +61,12 @@ def test_colmap_reconstructs_shared_tracks(tmp_path):
             rng.uniform(4.0, 7.0, 450),
         )
     )
-    coords = {}
+    coords, poses = {}, {}
     for i, name in enumerate(names):
-        camera_xyz = xyz - [0.6 * (i - 2), 0.04 * (i % 2), 0]
+        pose = np.eye(4)
+        pose[:3, 3] = [0.6 * (i - 2), 0.04 * (i % 2), 0]
+        poses[name] = pose
+        camera_xyz = xyz - pose[:3, 3]
         coords[name] = np.column_stack(
             (
                 500 * camera_xyz[:, 0] / camera_xyz[:, 2] + 320,
@@ -67,7 +74,10 @@ def test_colmap_reconstructs_shared_tracks(tmp_path):
             )
         )
 
+    calls = []
+
     def matcher(a, b):
+        calls.append((a.name, b.name))
         return coords[a.name], coords[b.name], np.ones(len(xyz))
 
     output = tmp_path / "sfm"
@@ -75,11 +85,21 @@ def test_colmap_reconstructs_shared_tracks(tmp_path):
         images,
         output,
         names,
-        list(combinations(names, 2)),
+        list(combinations(names, 2)) if pose_select_k is None else None,
         matcher,
+        priors=Priors({}, poses) if pose_select_k is not None else None,
+        pose_select_k=pose_select_k,
         camera_params=[500, 500, 320, 240],
         fix_intrinsics=True,
     )
+    if pose_select_k is not None:
+        assert calls == normalize_pairs(
+            pairs_from_poses(names, poses, pose_select_k), names
+        )
+        assert calls == read_pairs(output / "pairs.txt", names)
+        assert json.loads((output / "config.json").read_text())["pose_select_k"] == 3
+        with sqlite3.connect(output / "database.db") as db:
+            assert db.execute("SELECT COUNT(*) FROM pose_priors").fetchone() == (0,)
     assert result["verified_pairs"] >= 6
     assert max(m["registered_images"] for m in result["models"]) == 5
     model = pycolmap.Reconstruction(str(output / "sparse" / "0"))

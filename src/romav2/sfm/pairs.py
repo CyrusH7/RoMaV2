@@ -3,6 +3,13 @@
 from itertools import combinations
 from pathlib import Path
 
+import numpy as np
+
+from .calibration import validate_camera_to_world
+
+DEFAULT_POSE_TOP_K = 20
+ROTATION_POOL_MULTIPLIER = 3
+
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"}
 
 
@@ -45,6 +52,45 @@ def read_pairs(path: Path, names: list[str]) -> list[tuple[str, str]]:
 
 def exhaustive_pairs(names: list[str]) -> list[tuple[str, str]]:
     return list(combinations(names, 2))
+
+
+def validate_pose_top_k(value):
+    if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value < 1:
+        raise ValueError("Pose selection requires a positive integer top_k")
+    return int(value)
+
+
+def pairs_from_poses(names, poses, top_k=DEFAULT_POSE_TOP_K):
+    """Rank directed neighbors from OpenCV camera-to-world priors in meters."""
+    top_k = validate_pose_top_k(top_k)
+    names = sorted(names)
+    if len(names) < 2 or len(set(names)) != len(names):
+        raise ValueError(
+            "Pose selection requires at least two distinct image names and no duplicates"
+        )
+    missing = [name for name in names if name not in poses]
+    if missing:
+        raise ValueError(f"Missing camera-to-world pose for {missing[0]}")
+
+    transforms = np.stack(
+        [validate_camera_to_world(poses[name], name) for name in names]
+    )
+    rotations = transforms[:, :3, :3]
+    centers = transforms[:, :3, 3]
+    u, _, vt = np.linalg.svd(rotations)
+    rotations = u @ vt
+    pool_size = min(len(names) - 1, ROTATION_POOL_MULTIPLIER * top_k)
+    pairs = []
+    for i, name in enumerate(names):
+        # Relative rotation trace decreases monotonically with angle on [0, pi].
+        traces = np.einsum("nij,ij->n", rotations, rotations[i])
+        cos_angles = np.clip((traces - 1) / 2, -1, 1)
+        cos_angles[i] = -np.inf
+        pool = np.argsort(-cos_angles, kind="stable")[:pool_size]
+        distances = np.linalg.norm(centers[pool] - centers[i], axis=1)
+        neighbors = pool[np.argsort(distances, kind="stable")[:top_k]]
+        pairs.extend((name, names[j]) for j in neighbors)
+    return pairs
 
 
 def normalize_pairs(pairs, names):

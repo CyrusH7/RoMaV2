@@ -140,8 +140,7 @@ pairwise observations into shared per-image keypoints, writes a COLMAP database,
 performs geometric verification, removes verified match edges that would create
 tracks with multiple observations in one image, and runs COLMAP's incremental
 mapper and bundle adjustment. The default run is an **image-only baseline**, defined only up to similarity.
-Optional intrinsics and pose priors are available as described below; depth
-priors and pose-guided pair selection are not enabled by this pipeline.
+Optional intrinsics, pose priors and pose-guided pair selection are available below.
 
 Install the optional backend in the existing environment:
 
@@ -160,9 +159,25 @@ python -m romav2.sfm --images /path/to/images --output /path/to/new-output \
 By default all image pairs are matched, so cost grows quadratically. For larger
 collections provide `--pairs /path/to/pairs.txt`: each line contains two image
 paths relative to `--images`, separated by whitespace. Reversed duplicates are
-ignored. Image names must not contain whitespace. This file is the integration
-point for a future pose-based pair selector. Use `--image-glob` to filter input,
+ignored. Image names must not contain whitespace. Use `--image-glob` to filter input,
 e.g. `--image-glob '**/*.color.png'` to exclude depth PNGs in 7-Scenes.
+
+With per-image OpenCV RGB camera-to-world priors, pass `--priors priors.json`
+and `--pose-select 20` to select neighbors before matching. For each image the selector
+excludes itself, keeps up to 60 candidates with the smallest relative rotation
+angle, then selects the 20 closest camera centers in meters. For other values of
+K the rotation pool is 3K. The matcher processes the union of the directed
+selections once per unordered pair and writes it to `OUTPUT/pairs.txt`.
+Using priors only for pair selection leaves the mapper in its image-only mode.
+
+To prepare the Office 100-frame pair list on CPU using noise-free RGB poses:
+
+```bash
+PAIR_MODE=pose-select PRIOR_NOISE_M=0 PRIOR_NOISE_DEG=0 PREPARE_ONLY=1 bash scripts/quick_test_priors.sh
+```
+
+All reconstruction arms in this script share the same pair list. The default
+pair mode of the Office script is its original temporal window.
 
 For a shared calibrated PINHOLE camera, supply original-image pixel intrinsics:
 

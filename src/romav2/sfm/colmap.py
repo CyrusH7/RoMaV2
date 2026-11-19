@@ -16,7 +16,7 @@ from .database import create_database, verify_database
 from .io import RunRecord, write_json
 from .matching import FeatureStore
 from .options import PipelineOptions
-from .pairs import normalize_pairs
+from .pairs import normalize_pairs, pairs_from_poses
 
 LOG = logging.getLogger(__name__)
 
@@ -196,6 +196,7 @@ def reconstruct(
     calibration=None,
     fix_poses=False,
     init_from_poses=False,
+    pose_select_k=None,
 ):
     use_pose_prior = use_pose_prior or fix_poses or init_from_poses
     options = PipelineOptions(
@@ -217,6 +218,13 @@ def reconstruct(
     )
     images, output = Path(images).resolve(), Path(output).resolve()
     names = sorted(names)
+    if pose_select_k is not None:
+        if pairs is not None or priors is None:
+            raise ValueError(
+                "Pose selection requires priors and cannot use an explicit pair list"
+            )
+        pairs = pairs_from_poses(names, priors.poses, pose_select_k)
+        pose_select_k = int(pose_select_k)
     if calibration is not None:
         if camera_params is not None or use_intrinsics_prior:
             raise ValueError(
@@ -229,6 +237,7 @@ def reconstruct(
     pairs, sizes, camera_params = _preflight(
         images, output, names, pairs, options, camera_params, priors
     )
+    LOG.info("Selected %d images and %d unique pairs", len(names), len(pairs))
     output.mkdir(parents=True, exist_ok=True)
     run = RunRecord(output)
     try:
@@ -237,6 +246,7 @@ def reconstruct(
             {
                 **asdict(options),
                 "images": str(images),
+                "pose_select_k": pose_select_k,
                 "camera_params": None
                 if camera_params is None
                 else camera_params.tolist(),
