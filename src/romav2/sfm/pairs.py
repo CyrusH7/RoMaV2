@@ -61,7 +61,7 @@ def validate_pose_top_k(value):
 
 
 def pairs_from_poses(names, poses, top_k=DEFAULT_POSE_TOP_K):
-    """Rank directed neighbors from OpenCV camera-to-world priors in meters."""
+    """Select nearby centers from the 3K closest orientations per image."""
     top_k = validate_pose_top_k(top_k)
     names = sorted(names)
     if len(names) < 2 or len(set(names)) != len(names):
@@ -75,20 +75,19 @@ def pairs_from_poses(names, poses, top_k=DEFAULT_POSE_TOP_K):
     transforms = np.stack(
         [validate_camera_to_world(poses[name], name) for name in names]
     )
-    rotations = transforms[:, :3, :3]
     centers = transforms[:, :3, 3]
-    u, _, vt = np.linalg.svd(rotations)
+    u, _, vt = np.linalg.svd(transforms[:, :3, :3])
     rotations = u @ vt
     pool_size = min(len(names) - 1, ROTATION_POOL_MULTIPLIER * top_k)
     pairs = []
     for i, name in enumerate(names):
-        # Relative rotation trace decreases monotonically with angle on [0, pi].
         traces = np.einsum("nij,ij->n", rotations, rotations[i])
         cos_angles = np.clip((traces - 1) / 2, -1, 1)
         cos_angles[i] = -np.inf
-        pool = np.argsort(-cos_angles, kind="stable")[:pool_size]
-        distances = np.linalg.norm(centers[pool] - centers[i], axis=1)
-        neighbors = pool[np.argsort(distances, kind="stable")[:top_k]]
+        rotation_pool = np.argsort(-cos_angles, kind="stable")[:pool_size]
+        distances = np.linalg.norm(centers[rotation_pool] - centers[i], axis=1)
+        closest = np.argsort(distances, kind="stable")[:top_k]
+        neighbors = rotation_pool[closest]
         pairs.extend((name, names[j]) for j in neighbors)
     return pairs
 
