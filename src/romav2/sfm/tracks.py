@@ -1,6 +1,7 @@
 """Remove verified match edges that make multi-view tracks self-conflicting."""
 
 import numpy as np
+from scipy.cluster.hierarchy import DisjointSet
 
 
 def consistent_edge_mask(image_indices, node_a, node_b, scores):
@@ -92,3 +93,12 @@ def filter_verified_tracks(db, names, pairs, ids, store):
         db.write_two_view_geometry(ids[a], ids[b], geometry)
         pair_counts[f"{a} {b}"] = len(geometry.inlier_matches)
     return pair_counts, int((~mask).sum())
+
+
+def track_component_sizes(model):
+    components = DisjointSet(model.reg_image_ids())
+    for point in model.points3D.values():
+        elements = point.track.elements
+        for element in elements[1:]:
+            components.merge(elements[0].image_id, element.image_id)
+    return sorted((len(group) for group in components.subsets()), reverse=True)

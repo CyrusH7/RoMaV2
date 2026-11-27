@@ -3,9 +3,13 @@
 import hashlib
 import logging
 import platform
+from contextlib import closing
 from dataclasses import asdict
 from importlib.metadata import version
 from pathlib import Path
+from shutil import copyfile
+from sqlite3 import connect
+from tempfile import TemporaryDirectory
 
 import numpy as np
 import pycolmap
@@ -17,6 +21,7 @@ from .io import RunRecord, write_json
 from .matching import FeatureStore
 from .options import PipelineOptions
 from .pairs import normalize_pairs, pairs_from_poses
+from .tracks import track_component_sizes
 
 LOG = logging.getLogger(__name__)
 
@@ -63,10 +68,10 @@ def _preflight(images, output, names, pairs, options, camera_params, priors):
             sizes[name] = image.size
     if camera_params is not None:
         camera_params = validate_pinhole(camera_params)
-        if len(set(sizes.values())) != 1:
-            raise ValueError(
-                "A shared calibrated camera requires images of identical dimensions"
-            )
+    if (camera_params is not None or options.single_camera) and len(
+        set(sizes.values())
+    ) != 1:
+        raise ValueError("A shared camera requires images of identical dimensions")
     if options.use_intrinsics_prior:
         for name in names:
             validate_pinhole(priors.cameras[name])
@@ -92,6 +97,10 @@ def _mapping_options(options):
     return mapper
 
 
+class _InsufficientPriorGeometry(RuntimeError):
+    pass
+
+
 def _triangulate_known_poses(db_path, images, sparse, priors, options):
     """Use the database IDs throughout so verified match indices stay valid."""
     model = pycolmap.Reconstruction()
@@ -105,7 +114,9 @@ def _triangulate_known_poses(db_path, images, sparse, priors, options):
             model.add_frame(frame)
             for image_id in frame.image_ids:
                 frame_ids[image_id.id] = frame.frame_id
-        for image in db.read_all_images():
+        db_images = db.read_all_images()
+        frame_names = [image.name for image in db_images]
+        for image in db_images:
             image.frame_id = frame_ids[image.image_id]
             model.add_image(image)
             model.frames[image.frame_id].set_cam_from_world(
@@ -115,8 +126,7 @@ def _triangulate_known_poses(db_path, images, sparse, priors, options):
             model.register_frame(image.frame_id)
     mapper = _mapping_options(options)
     mapper.use_prior_position = False
-    if model.num_reg_images() == 2:
-        mapper.triangulation.ignore_two_view_tracks = False
+    mapper.triangulation.ignore_two_view_tracks = False
     model = pycolmap.triangulate_points(
         model,
         str(db_path),
@@ -126,8 +136,13 @@ def _triangulate_known_poses(db_path, images, sparse, priors, options):
         refine_intrinsics=False,
     )
     if model.num_points3D() == 0:
-        raise RuntimeError("Fixed camera poses produced no triangulated points")
+        raise _InsufficientPriorGeometry(
+            "Fixed camera poses produced no triangulated points"
+        )
     if options.init_from_poses:
+        before = {
+            im.name: im.num_points3D for im in model.images.values() if im.has_pose
+        }
         # Removing a weak view can shorten tracks in the remaining views.
         while True:
             weak = [
@@ -139,12 +154,92 @@ def _triangulate_known_poses(db_path, images, sparse, priors, options):
                 break
             for frame_id in weak:
                 model.deregister_frame(frame_id)
+        retained = {model.images[i].name for i in model.reg_image_ids()}
+        write_json(
+            sparse.parent / "prior_triangulation.json",
+            {
+                "min_observations": 6,
+                "images": {
+                    name: {
+                        "initial_points": before.get(name, 0),
+                        "retained": name in retained,
+                    }
+                    for name in frame_names
+                },
+            },
+        )
         if model.num_reg_images() < 3:
-            raise RuntimeError(
+            raise _InsufficientPriorGeometry(
                 "Prior initialization needs three views with six triangulated observations each"
             )
     model.update_point_3d_errors()
     return {0: model}
+
+
+def _validate_refined_map(
+    db_path, images, sparse, priors, candidate, options, verify, report
+):
+    with TemporaryDirectory(dir=sparse.parent) as directory:
+        baseline = Path(directory)
+        baseline_db = baseline / "database.db"
+        baseline_sparse = baseline / "sparse"
+        baseline_sparse.mkdir()
+        with (
+            closing(connect(db_path)) as source,
+            closing(connect(baseline_db)) as destination,
+        ):
+            source.backup(destination)
+        baseline_stats = verify(priors, baseline_db)
+
+        baseline_models = None
+        try:
+            baseline_models = _triangulate_known_poses(
+                baseline_db, images, baseline_sparse, priors, options
+            )
+        except _InsufficientPriorGeometry:
+            pass
+
+        refined_stats = verify(candidate, db_path)
+        refined_models = None
+        try:
+            refined_models = _triangulate_known_poses(
+                db_path, images, sparse, candidate, options
+            )
+        except _InsufficientPriorGeometry:
+            if baseline_models is None:
+                raise
+
+        baseline_size = (
+            max(track_component_sizes(baseline_models[0]), default=0)
+            if baseline_models
+            else 0
+        )
+        refined_size = (
+            max(track_component_sizes(refined_models[0]), default=0)
+            if refined_models
+            else 0
+        )
+        report["initial_map_largest_component"] = {
+            "input_poses": baseline_size,
+            "refined_poses": refined_size,
+        }
+        if refined_size >= baseline_size:
+            return refined_models, refined_stats
+
+        with (
+            closing(connect(baseline_db)) as source,
+            closing(connect(db_path)) as destination,
+        ):
+            source.backup(destination)
+        copyfile(
+            baseline / "prior_triangulation.json",
+            sparse.parent / "prior_triangulation.json",
+        )
+        model_path = sparse / "0"
+        model_path.mkdir(exist_ok=True)
+        baseline_models[0].write(str(model_path))
+        report.update(status="kept_input_poses", reason="refined_map_lost_connectivity")
+        return baseline_models, baseline_stats
 
 
 def _snapshot_priors(priors, names, options):
@@ -187,6 +282,7 @@ def reconstruct(
     use_intrinsics_prior=False,
     use_pose_prior=False,
     prior_iterations=3,
+    joint_prior_ba=False,
     camera_model=None,
     num_threads=4,
     min_match_score=0.0,
@@ -197,11 +293,15 @@ def reconstruct(
     fix_poses=False,
     init_from_poses=False,
     pose_select_k=None,
+    single_camera=False,
+    refine_initial_pose=False,
 ):
     use_pose_prior = use_pose_prior or fix_poses or init_from_poses
     options = PipelineOptions(
         fix_poses=fix_poses,
         init_from_poses=init_from_poses,
+        single_camera=single_camera,
+        refine_initial_pose=refine_initial_pose,
         cell_size=cell_size,
         min_matches=min_matches,
         fix_intrinsics=fix_intrinsics,
@@ -209,6 +309,7 @@ def reconstruct(
         use_intrinsics_prior=use_intrinsics_prior,
         use_pose_prior=use_pose_prior,
         prior_iterations=prior_iterations,
+        joint_prior_ba=joint_prior_ba,
         camera_model=camera_model,
         num_threads=num_threads,
         min_match_score=min_match_score,
@@ -279,13 +380,18 @@ def reconstruct(
         pairs_path = output / "pairs.txt"
         pairs_path.write_text("".join(f"{a} {b}\n" for a, b in pairs), encoding="utf-8")
         with run.stage("matching"):
-            store = FeatureStore(cell_size, min_match_score=min_match_score)
-            sampled_counts = {}
-            for index, (a, b) in enumerate(pairs, 1):
-                LOG.info("Matching %d/%d: %s <-> %s", index, len(pairs), a, b)
-                xy_a, xy_b, scores = matcher(images / a, images / b)
-                sampled_counts[f"{a} {b}"] = len(scores)
-                store.add(a, b, xy_a, xy_b, scores, sizes)
+            if hasattr(matcher, "load_indexed_matches"):
+                store, sampled_counts = matcher.load_indexed_matches(
+                    names, pairs, min_match_score
+                )
+            else:
+                store = FeatureStore(cell_size, min_match_score=min_match_score)
+                sampled_counts = {}
+                for index, (a, b) in enumerate(pairs, 1):
+                    LOG.info("Matching %d/%d: %s <-> %s", index, len(pairs), a, b)
+                    xy_a, xy_b, scores = matcher(images / a, images / b)
+                    sampled_counts[f"{a} {b}"] = len(scores)
+                    store.add(a, b, xy_a, xy_b, scores, sizes)
             raw_counts = {f"{a} {b}": len(m) for (a, b), m in store.matches.items()}
             write_json(
                 output / "matching.json",
@@ -299,10 +405,58 @@ def reconstruct(
                 db_path, images, names, sizes, store, options, camera_params, priors
             )
             write_json(output / "cameras_initial.json", cameras)
-        with run.stage("geometric_verification"):
-            verified, pair_counts, conflicts = verify_database(
-                db_path, pairs_path, names, pairs, ids, store, options, priors
+        initial_priors = priors
+        if options.refine_initial_pose:
+            from .initialization import refine_initial_pair
+            from .pose_graph import refine_pose_graph
+
+            initialize = (
+                refine_pose_graph
+                if options.refine_initial_pose == "graph"
+                else refine_initial_pair
             )
+
+            with run.stage("initial_pose_refinement"):
+                initial_priors, refinement = initialize(
+                    db_path, pairs, ids, priors, options
+                )
+                write_json(output / "initial_pose_refinement.json", refinement)
+
+        def verify(geometry_priors, database_path=db_path, match_store=store):
+            return verify_database(
+                database_path,
+                pairs_path,
+                names,
+                pairs,
+                ids,
+                match_store,
+                options,
+                geometry_priors,
+            )
+
+        sparse = output / "sparse"
+        sparse.mkdir()
+        models = None
+        if initial_priors is priors:
+            with run.stage("geometric_verification"):
+                verified, pair_counts, conflicts = verify(priors)
+        else:
+            with run.stage("validate_initial_map"):
+                models, (verified, pair_counts, conflicts) = _validate_refined_map(
+                    db_path,
+                    images,
+                    sparse,
+                    priors,
+                    initial_priors,
+                    options,
+                    verify,
+                    refinement,
+                )
+            if refinement["status"] != "refined":
+                initial_priors = priors
+            write_json(output / "initial_pose_refinement.json", refinement)
+
+        with run.stage("pair_summary"):
             write_json(
                 output / "pair_statistics.json",
                 {
@@ -315,19 +469,17 @@ def reconstruct(
                     for key in raw_counts
                 },
             )
-        del store
-        sparse = output / "sparse"
-        sparse.mkdir()
-        if options.triangulate_from_priors:
+        del verify, store
+        if models is None and options.triangulate_from_priors:
             with run.stage(
                 "prior_pose_triangulation"
                 if init_from_poses
                 else "fixed_pose_triangulation"
             ):
                 models = _triangulate_known_poses(
-                    db_path, images, sparse, priors, options
+                    db_path, images, sparse, initial_priors, options
                 )
-        else:
+        elif models is None:
             with run.stage("incremental_mapping"):
                 models = pycolmap.incremental_mapping(
                     str(db_path),
@@ -358,6 +510,7 @@ def reconstruct(
                             model,
                             priors,
                             iterations=prior_iterations,
+                            joint_prior_ba=joint_prior_ba,
                             fix_intrinsics=fix_intrinsics,
                             num_threads=num_threads,
                         )
@@ -365,10 +518,27 @@ def reconstruct(
                         refinement["initialization"] = (
                             "input_poses" if init_from_poses else "incremental_mapper"
                         )
+                        if initial_priors is not priors:
+                            refinement["initialization"] = {
+                                "joint": "sampson_lm_joint",
+                                "landmarks": "external_landmarks",
+                                "graph": "raw_match_pose_graph",
+                            }.get(
+                                options.refine_initial_pose, "sampson_lm_fixed_centers"
+                            )
                     else:
                         refinement = {
                             "status": "skipped_fewer_than_three_registered_images"
                         }
+                    if init_from_poses:
+                        from .registration import recover_prior_views
+
+                        recovery = recover_prior_views(
+                            model, db_path, pairs, priors, options
+                        )
+                        write_json(
+                            sparse / str(model_id) / "prior_registration.json", recovery
+                        )
                     model.write(str(sparse / str(model_id)))
                     write_json(
                         sparse / str(model_id) / "prior_refinement.json", refinement

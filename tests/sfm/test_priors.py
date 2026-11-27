@@ -1,5 +1,6 @@
 import json
 from itertools import combinations
+from pathlib import Path
 
 import numpy as np
 import pycolmap
@@ -16,6 +17,7 @@ def test_prior_validation(tmp_path):
     doc = {
         "pose_convention": "camera_to_world_opencv",
         "units": "meters",
+        "rig_calibration": {"depth_from_rgb": np.eye(4).tolist()},
         "images": {
             "a.png": {
                 "intrinsics": [500, 500, 320, 240],
@@ -27,13 +29,18 @@ def test_prior_validation(tmp_path):
     path.write_text(json.dumps(doc))
     loaded = load_priors(path, ["a.png"])
     assert np.allclose(loaded.poses["a.png"], np.eye(4))
+    assert loaded.rig_calibration == doc["rig_calibration"]
     doc["images"]["a.png"]["camera_to_world"][0][0] = -1
     path.write_text(json.dumps(doc))
     with pytest.raises(ValueError, match="Invalid rigid"):
         load_priors(path, ["a.png"])
 
 
-def test_full_prior_pipeline(tmp_path):
+@pytest.mark.parametrize(
+    ("graph", "rotation_noise", "expected_status"),
+    [(False, 0.01, None), (True, 0.01, "kept_input_poses"), (True, 0.03, "refined")],
+)
+def test_full_prior_pipeline(tmp_path, graph, rotation_noise, expected_status):
     root = tmp_path / "images"
     root.mkdir()
     names = [f"{i}.png" for i in range(5)]
@@ -59,7 +66,9 @@ def test_full_prior_pipeline(tmp_path):
     noisy = {n: t.copy() for n, t in poses.items()}
     for pose in noisy.values():
         pose[:3, 3] += rng.normal(0, 0.01, 3)
-        pose[:3, :3] = Rotation.from_rotvec(rng.normal(0, 0.01, 3)).as_matrix()
+        pose[:3, :3] = Rotation.from_rotvec(
+            rng.normal(0, rotation_noise, 3)
+        ).as_matrix()
     priors = Priors(intrinsics, noisy, 0.05, 3.0)
     out = tmp_path / "both"
     result = reconstruct(
@@ -73,9 +82,19 @@ def test_full_prior_pipeline(tmp_path):
         use_pose_prior=True,
         fix_intrinsics=True,
         prior_iterations=2,
+        init_from_poses=graph,
+        refine_initial_pose="graph" if graph else False,
+        joint_prior_ba=True,
         num_threads=1,
     )
     assert max(m["registered_images"] for m in result["models"]) == 5
+    if graph:
+        seed = json.loads((out / "initial_pose_refinement.json").read_text())
+        assert seed["status"] == expected_status
+        if expected_status == "refined":
+            assert seed["held_out_score_after_px"] < seed["held_out_score_before_px"]
+        else:
+            assert seed["reason"] == "raw_matches_support_input_poses"
     m = pycolmap.Reconstruction(str(out / "sparse/0"))
     assert len(m.cameras) == 2
     for image in m.images.values():
@@ -89,7 +108,18 @@ def test_full_prior_pipeline(tmp_path):
     metrics = trajectory_metrics(estimated, poses)
     assert metrics["raw_ate_rmse_m"] < 0.08
     assert abs(metrics["sim3_scale_correction"] - 1) < 0.05
-    assert (out / "sparse/0/prior_refinement.json").exists()
+    assert (
+        json.loads((out / "sparse/0/prior_refinement.json").read_text())["solver"]
+        == "joint_metric"
+    )
+    image = m.find_image_with_name(names[0])
+    depth_errors = []
+    for point in image.points2D:
+        if point.has_point3D():
+            index = np.argmin(np.linalg.norm(coords[image.name] - point.xy, axis=1))
+            depth_errors.append(m.points3D[point.point3D_id].xyz[2] - xyz[index, 2])
+    assert len(depth_errors) > 200
+    assert np.sqrt(np.mean(np.square(depth_errors))) < 0.1
     from types import SimpleNamespace
 
     from romav2.sfm.ablation import evaluate
@@ -250,6 +280,11 @@ def test_fixed_pose_triangulation_uses_input_world_coordinates(tmp_path):
     Image.new("RGB", (640, 480)).save(images / missing)
     all_names = names + [missing]
     all_priors = Priors({n: k for n in all_names}, {**poses, missing: np.eye(4)})
+    behind = {}
+    for name in names[:2]:
+        pose = poses[name]
+        camera_xyz = (np.array([0.1, 1.6, -6.0]) - pose[:3, 3]) @ pose[:3, :3]
+        behind[name] = camera_xyz[:2] / camera_xyz[2] * k[:2] + k[2:]
 
     def partial_matcher(a, b):
         if missing in (a.name, b.name):
@@ -257,9 +292,9 @@ def test_fixed_pose_triangulation_uses_input_world_coordinates(tmp_path):
         xy_a, xy_b, scores = matcher(a, b)
         if (a.name, b.name) == (names[0], names[1]):
             return (
-                np.vstack((xy_a, [40, 40])),
-                np.vstack((xy_b, [40, 435])),
-                np.append(scores, 1),
+                np.vstack((xy_a, [40, 40], behind[a.name])),
+                np.vstack((xy_b, [40, 435], behind[b.name])),
+                np.append(scores, [1, 1]),
             )
         return xy_a, xy_b, scores
 
@@ -280,9 +315,10 @@ def test_fixed_pose_triangulation_uses_input_world_coordinates(tmp_path):
     with pycolmap.Database.open(str(seeded / "database.db")) as db:
         a, b = [db.read_image_with_name(n).image_id for n in names[:2]]
         kp = db.read_keypoints(a)[:, :2]
-        (bad_idx,) = np.flatnonzero(np.all(kp == [40, 40], axis=1))
-        assert bad_idx in db.read_matches(a, b)[:, 0]
-        assert bad_idx not in db.read_two_view_geometry(a, b).inlier_matches[:, 0]
+        for bad_xy in ([40, 40], behind[names[0]]):
+            (bad_idx,) = np.flatnonzero(np.all(np.isclose(kp, bad_xy), axis=1))
+            assert bad_idx in db.read_matches(a, b)[:, 0]
+            assert bad_idx not in db.read_two_view_geometry(a, b).inlier_matches[:, 0]
     assert seeded_result["models"][0]["registered_images"] == len(names)
     info = json.loads((seeded / "sparse/0/prior_refinement.json").read_text())
     assert info["initialization"] == "input_poses"
@@ -348,3 +384,370 @@ def test_fixed_pose_triangulation_uses_input_world_coordinates(tmp_path):
         num_threads=1,
     )
     assert pycolmap.Reconstruction(str(two_views / "sparse/0")).num_points3D() > 200
+
+    # Each disjoint feature group appears in exactly two cameras of a larger scene.
+    edges = list(zip(names, names[1:]))
+
+    def pair_only(a, b):
+        edge = edges.index((a.name, b.name))
+        indices = slice(50 * edge, 50 * (edge + 1))
+        return keypoints[a.name][indices], keypoints[b.name][indices], np.ones(50)
+
+    chain = tmp_path / "known_baselines"
+    reconstruct(
+        images,
+        chain,
+        names,
+        edges,
+        pair_only,
+        priors=priors,
+        cell_size=0.01,
+        use_intrinsics_prior=True,
+        fix_intrinsics=True,
+        init_from_poses=True,
+        prior_iterations=1,
+        num_threads=1,
+    )
+    chain_model = pycolmap.Reconstruction(str(chain / "sparse/0"))
+    assert chain_model.num_reg_images() == len(names)
+    assert all(im.num_points3D >= 6 for im in chain_model.images.values())
+    assert all(p.track.length() == 2 for p in chain_model.points3D.values())
+
+
+def test_adjacent_metrics_ignore_gaps():
+    reference = {}
+    for i in range(5):
+        pose = np.eye(4)
+        pose[0, 3] = i
+        reference[str(i)] = pose
+    poses = {n: reference[n] for n in ("0", "2", "4")}
+    metrics = trajectory_metrics(poses, reference)
+    assert metrics["adjacent_rpe_pairs"] == 0
+    assert metrics["adjacent_rpe_rotation_mean_deg"] is None
+    poses["1"] = reference["1"]
+    assert trajectory_metrics(poses, reference)["adjacent_rpe_pairs"] == 2
+
+
+def test_prior_registration_retries_against_map_and_rejects_unsupported_poses(tmp_path):
+    names = [f"v{i}.png" for i in range(7)]
+    images = tmp_path / "images"
+    images.mkdir()
+    k = np.array([500.0, 500.0, 320.0, 240.0])
+    xyz = np.random.default_rng(729).uniform([-1, -1, 4], [1, 1, 6], (120, 3))
+    poses, xy = {}, {}
+    for i, name in enumerate(names):
+        Image.new("RGB", (640, 480)).save(images / name)
+        center = np.array([(i - 2) * 0.24, 0.0, 0.0])
+        local = xyz - center
+        xy[name] = k[:2] * local[:, :2] / local[:, 2:] + k[2:]
+        pose = np.eye(4)
+        pose[:3, 3] = center
+        if i >= 4:
+            pose[:3, :3] = Rotation.from_euler(
+                "x", 30 if i == 5 else 6, degrees=True
+            ).as_matrix()
+        poses[name] = pose
+
+    def matcher(a, b):
+        return xy[a.name], xy[b.name], np.ones(len(xyz))
+
+    pairs = (
+        list(combinations(names[:4], 2))
+        + [(a, b) for a in names[:4] for b in names[4:6]]
+        + [(names[0], names[6])]
+    )
+    out = tmp_path / "model"
+    reconstruct(
+        images,
+        out,
+        names,
+        pairs,
+        matcher,
+        priors=Priors(dict.fromkeys(names, k), poses),
+        use_intrinsics_prior=True,
+        fix_intrinsics=True,
+        init_from_poses=True,
+        num_threads=1,
+        prior_iterations=1,
+        cell_size=0.01,
+    )
+    diagnostic = json.loads((out / "sparse/0/prior_registration.json").read_text())
+    assert diagnostic[names[4]]["status"] == "registered"
+    assert diagnostic[names[5]]["status"] == "outside_prior_uncertainty"
+    assert diagnostic[names[6]]["status"] == "insufficient_reference_geometry"
+    model = pycolmap.Reconstruction(str(out / "sparse/0"))
+    assert model.num_reg_images() == 5
+    view = model.find_image_with_name(names[4])
+    assert view.num_points3D == diagnostic[names[4]]["inliers"]
+    np.testing.assert_allclose(
+        view.projection_center(), poses[names[4]][:3, 3], atol=1e-3
+    )
+    np.testing.assert_allclose(
+        view.cam_from_world().rotation.matrix(), np.eye(3), atol=1e-4
+    )
+
+
+def test_initial_sampson_refines_orientation_without_moving_centers(tmp_path):
+    images = tmp_path / "images"
+    images.mkdir()
+    names = ["a.png", "b.png", "c.png", "d.png"]
+    rng = np.random.default_rng(7)
+    xyz = rng.uniform([-0.8, -0.6, 3.5], [0.8, 0.65, 5.5], (160, 3))
+    intrinsics = {}
+    input_poses = {}
+    pixels = {}
+    for i, name in enumerate(names):
+        Image.new("RGB", (640, 480)).save(images / name)
+        k = np.array([530.0 + 10 * i, 460.0, 320.0, 240.0])
+        intrinsics[name] = k
+        pose = np.eye(4)
+        pose[:3, 3] = [i * 0.24, 0.08 * (i % 2), 0.04 * i]
+        local = xyz - pose[:3, 3]
+        pixels[name] = local[:, :2] / local[:, 2:] * k[:2] + k[2:]
+        if i == 1:
+            pose[:3, :3] = Rotation.from_euler("x", 1.4, degrees=True).as_matrix()
+        input_poses[name] = pose
+    priors = Priors(intrinsics, input_poses)
+    pairs = list(combinations(names, 2))
+
+    def matcher(a, b):
+        return pixels[a.name], pixels[b.name], np.ones(len(xyz))
+
+    def run(path, priors, mode=True):
+        return reconstruct(
+            images,
+            path,
+            names,
+            pairs,
+            matcher,
+            priors=priors,
+            use_intrinsics_prior=True,
+            fix_intrinsics=True,
+            init_from_poses=True,
+            refine_initial_pose=mode,
+            prior_iterations=1,
+            num_threads=1,
+            cell_size=0.01,
+        )
+
+    out = tmp_path / "refined"
+    original = {n: pose.copy() for n, pose in input_poses.items()}
+    result = run(out, priors)
+    report = json.loads((out / "initial_pose_refinement.json").read_text())
+    selected = report["selected"]
+    assert report["status"] == "refined"
+    assert report["translation_locked"] is True
+    assert selected["refined_image"] == "b.png"
+    updated = np.asarray(report["camera_to_world"])
+    np.testing.assert_allclose(updated[:3, 3], original["b.png"][:3, 3], atol=1e-12)
+    assert selected["center_shift_m"] == pytest.approx(0.0, abs=1e-12)
+    assert np.degrees(Rotation.from_matrix(updated[:3, :3]).magnitude()) < 0.35
+    assert (
+        selected["held_out_median_px_after"] < selected["held_out_median_px_before"] / 4
+    )
+    assert selected["third_view_tracks"] >= 20
+    assert (
+        selected["third_view_clipped_px_after"]
+        < selected["third_view_clipped_px_before"]
+    )
+    assert selected["refined_baseline_m"] == pytest.approx(
+        selected["baseline_m"], abs=1e-12
+    )
+    assert result["models"][0]["registered_images"] == len(names)
+    snapshot = json.loads((out / "priors_used.json").read_text())
+    for n in names:
+        np.testing.assert_array_equal(priors.poses[n], original[n])
+        np.testing.assert_array_equal(
+            snapshot["images"][n]["camera_to_world"], original[n]
+        )
+    final = json.loads((out / "sparse/0/prior_refinement.json").read_text())
+    assert final["initialization"] == "sampson_lm_fixed_centers"
+
+    from dataclasses import replace
+
+    perturbed = {n: pose.copy() for n, pose in original.items()}
+    perturbed["b.png"][:3, 3] += [0.0, 0.024, -0.008]
+    joint_output = tmp_path / "joint"
+    run(joint_output, replace(priors, poses=perturbed), mode="joint")
+    report = json.loads((joint_output / "initial_pose_refinement.json").read_text())
+    assert report["status"] == "refined"
+    assert report["mode"] == "joint"
+    update = report["selected"]
+    assert update["refined_image"] == "b.png"
+    estimate = np.asarray(update["camera_to_world"])
+    assert np.degrees(Rotation.from_matrix(estimate[:3, :3]).magnitude()) < 1.4
+    assert np.linalg.norm(estimate[:3, 3] - original["b.png"][:3, 3]) < np.linalg.norm(
+        perturbed["b.png"][:3, 3] - original["b.png"][:3, 3]
+    )
+    ba = json.loads((joint_output / "sparse/0/prior_refinement.json").read_text())
+    assert ba["initialization"] == "sampson_lm_joint"
+
+    skipped = tmp_path / "skipped"
+    run(skipped, replace(priors, position_sigma=1.0))
+    report = json.loads((skipped / "initial_pose_refinement.json").read_text())
+    assert report["status"] == "kept_input_poses"
+
+
+def test_refined_map_falls_back_if_visual_connectivity_drops(tmp_path, monkeypatch):
+    from romav2.sfm import colmap
+    from romav2.sfm.io import write_json
+    from romav2.sfm.tracks import track_component_sizes
+
+    names = list(range(4))
+    first = [[0, 1], [1, 2], [2, 3]]
+    second = [[0, 1], [2, 3]]
+    original_priors, refined_priors = object(), object()
+    db_path = tmp_path / "database.db"
+    sparse = tmp_path / "sparse"
+    sparse.mkdir()
+
+    class Model:
+        def __init__(self, tracks):
+            from types import SimpleNamespace
+
+            self.points3D = {
+                i: SimpleNamespace(
+                    track=SimpleNamespace(
+                        elements=[SimpleNamespace(image_id=n) for n in track]
+                    )
+                )
+                for i, track in enumerate(tracks)
+            }
+
+        def reg_image_ids(self):
+            return names
+
+        def write(self, path):
+            write_json(Path(path) / "model.json", {"tracks": len(self.points3D)})
+
+    def verify(priors, db):
+        from sqlite3 import connect
+
+        with connect(db) as conn:
+            conn.execute("CREATE TABLE IF NOT EXISTS geometry (prior TEXT)")
+            conn.execute(
+                "INSERT INTO geometry VALUES (?)",
+                ("original" if priors is original_priors else "refined",),
+            )
+        return priors
+
+    def triangulate(db, images, sparse, priors, options):
+        tracks = first if priors is original_priors else second
+        write_json(sparse.parent / "prior_triangulation.json", {"tracks": len(tracks)})
+        return {0: Model(tracks)}
+
+    monkeypatch.setattr(colmap, "_triangulate_known_poses", triangulate)
+    report = {}
+    models, stats = colmap._validate_refined_map(
+        db_path, tmp_path, sparse, original_priors, refined_priors, None, verify, report
+    )
+    assert stats is original_priors
+    assert track_component_sizes(models[0]) == [4]
+    assert report["reason"] == "refined_map_lost_connectivity"
+    from sqlite3 import connect
+
+    with connect(db_path) as conn:
+        assert conn.execute("SELECT prior FROM geometry").fetchall() == [("original",)]
+
+
+def test_joint_metric_baseline_needs_consistent_precise_reference_views():
+    from romav2.sfm.initialization import _metric_baseline
+
+    seed_length, true_length = 0.5, 0.535
+    xyz = np.random.default_rng(11).uniform([-0.8, -0.4, 3.0], [0.8, 0.4, 5.0], (64, 3))
+
+    def rays(points):
+        return points / points[:, 2:]
+
+    def pose(center):
+        return pycolmap.Rigid3d(pycolmap.Rotation3d(), -np.asarray(center))
+
+    obs = (rays(xyz), rays(xyz - [true_length, 0, 0]))
+    tracks = [
+        (pose([x, 0, 0]), np.arange(len(xyz)), rays(xyz - [x, 0, 0])[:, :2], np.ones(2))
+        for x in (-3.0, 3.0, 4.0)
+    ]
+    args = (pose([0, 0, 0]), pose([seed_length, 0, 0]), obs)
+    measured, count = _metric_baseline(*args, tracks, 0.03, 0.0002, 20)
+    assert count == 3
+    assert seed_length < measured <= true_length + 1e-12
+    assert _metric_baseline(*args, tracks[:2], 0.03, 0.0002, 20)[0] == pytest.approx(
+        seed_length
+    )
+    assert _metric_baseline(*args, tracks, 0.03, 0.10, 20)[0] == pytest.approx(
+        seed_length
+    )
+
+
+def test_landmark_seed_uses_external_parallax_and_preserves_metric_midpoint():
+    from romav2.sfm.seed_landmarks import refine_landmark_pair
+
+    rng = np.random.default_rng(45)
+    xyz = rng.uniform([-1, -0.7, 1.5], [1, 0.7, 8], size=(160, 3))
+    focal = np.array([510.0, 540.0])
+
+    def camera(x, degrees=0):
+        r = Rotation.from_euler("x", degrees, degrees=True).as_matrix()
+        return pycolmap.Rigid3d(pycolmap.Rotation3d(r), -r @ np.array([x, 0, 0]))
+
+    def rays(cam):
+        points = cam * xyz
+        return points / points[:, 2:]
+
+    truth = (camera(-0.25), camera(0.25))
+    inputs = (camera(-0.23, 1.15), camera(0.23, -1.15))
+    obs = (*map(rays, truth), focal, focal)
+    indices = np.arange(len(xyz))
+
+    def tracks(centers):
+        return [(cam, indices, rays(cam)[:, :2], focal) for cam in map(camera, centers)]
+
+    def solve(poses, centers):
+        return refine_landmark_pair(
+            poses, obs, tracks(centers), indices[::4], 0.035, 0.05, 4, 20
+        )[0]
+
+    refs = [-2.0, -1.2, -0.6, 0.8, 1.1, 2.0]
+    matrices = solve(inputs, refs)
+    assert matrices is not None
+    a, b = (pycolmap.Rigid3d(m[:3]).inverse() for m in matrices)
+    target = truth[1] * truth[0].inverse()
+    initial = inputs[1] * inputs[0].inverse()
+    updated = b * a.inverse()
+    assert (
+        updated.rotation * target.rotation.inverse()
+    ).angle() < 0.2 * initial.rotation.angle()
+    assert np.linalg.norm(
+        updated.translation - target.translation
+    ) < 0.5 * np.linalg.norm(initial.translation - target.translation)
+    np.testing.assert_allclose(matrices[0][:3, 3] + matrices[1][:3, 3], 0, atol=1e-12)
+    assert solve(truth, refs) is None
+    assert solve(inputs, refs[:2]) is None
+    assert solve(inputs, [1.0, 1.0, 1.0]) is None
+
+
+def test_final_refinement_filters_low_parallax_at_zero_reprojection_error(monkeypatch):
+    from romav2.sfm import priors as module
+
+    options = pycolmap.SyntheticDatasetOptions()
+    options.num_rigs, options.num_frames_per_rig, options.num_points3D = 1, 3, 2
+    model = pycolmap.synthesize_dataset(options)
+    near, far = sorted(model.points3D)
+    model.points3D[near].xyz = [0, 0, 5]
+    model.points3D[far].xyz = [0, 0, 1000]
+    poses = {}
+    for i, image in enumerate(model.images.values()):
+        pose = np.eye(4)
+        pose[0, 3] = i
+        poses[image.name] = pose
+        transform = pycolmap.Rigid3d(pose[:3]).inverse()
+        model.frames[image.frame_id].set_cam_from_world(image.camera_id, transform)
+        for obs in image.points2D:
+            if obs.has_point3D():
+                obs.xy = image.camera.img_from_cam(
+                    transform * model.points3D[obs.point3D_id].xyz
+                )
+    monkeypatch.setattr(module, "_alternate_refinement", lambda *args: None)
+    report = module.refine_with_pose_priors(model, Priors({}, poses))
+    assert list(model.points3D) == [near]
+    assert report["points_removed_after_refinement"] == 1

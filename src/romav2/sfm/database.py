@@ -29,7 +29,11 @@ def create_database(path, images, names, sizes, store, options, camera_params, p
     else:
         reader = pycolmap.ImageReaderOptions()
         reader.camera_model = options.camera_model or "SIMPLE_RADIAL"
-        mode = pycolmap.CameraMode.AUTO
+        mode = (
+            pycolmap.CameraMode.SINGLE
+            if options.single_camera
+            else pycolmap.CameraMode.AUTO
+        )
         if camera_params is not None:
             reader.camera_model = "PINHOLE"
             reader.camera_params = ",".join(map(str, camera_params))
@@ -104,6 +108,17 @@ def _verify_prior_geometry(db, pairs, ids, priors, max_error):
                 normal_b = np.linalg.norm(line_b[:, :2] / cam_b.params[:2], axis=1)
                 normal = np.minimum(normal_a, normal_b)
                 valid = (normal > 1e-15) & (numerator <= max_error * normal)
+                # Cross products recover the depth signs in both cameras.
+                ray_a_in_b = rays_a @ rel.rotation.matrix().T
+                cross = np.cross(ray_a_in_b, rays_b)
+                depth_a = np.sum(np.cross(rays_b, rel.translation) * cross, axis=1)
+                depth_b = np.sum(np.cross(ray_a_in_b, rel.translation) * cross, axis=1)
+                parallel = np.linalg.norm(cross, axis=1) <= (
+                    1e-12
+                    * np.linalg.norm(ray_a_in_b, axis=1)
+                    * np.linalg.norm(rays_b, axis=1)
+                )
+                valid &= parallel | ((depth_a > 0) & (depth_b > 0))
                 geometry.config = pycolmap.TwoViewGeometryConfiguration.CALIBRATED
                 geometry.E = essential
             geometry.inlier_matches = matches[valid]

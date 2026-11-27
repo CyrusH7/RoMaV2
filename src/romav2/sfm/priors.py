@@ -1,7 +1,7 @@
-"""Validated OpenCV camera priors and alternating pose/structure refinement.
+"""Validated OpenCV camera priors and metric pose/structure refinement.
 
 All poses are camera-to-world, with x right, y down, z forward. Translations
-and position sigmas use the same metric unit (meters in the quick experiment).
+and position sigmas are in meters.
 """
 
 import json
@@ -57,7 +57,12 @@ def load_priors(path, names):
     if not all(np.isfinite(x) and x > 0 for x in (position_sigma, rotation_sigma)):
         raise ValueError("Prior standard deviations must be finite and positive")
     return Priors(
-        cameras, poses, position_sigma, rotation_sigma, data.get("calibration")
+        cameras,
+        poses,
+        position_sigma,
+        rotation_sigma,
+        calibration=data.get("calibration"),
+        rig_calibration=data.get("rig_calibration"),
     )
 
 
@@ -154,18 +159,72 @@ def _prepare_prior_frame(model, priors):
 
 
 def refine_with_pose_priors(
-    model, priors, *, iterations=3, fix_intrinsics=False, pixel_sigma=1.0, num_threads=4
+    model,
+    priors,
+    *,
+    iterations=3,
+    fix_intrinsics=False,
+    pixel_sigma=1.0,
+    num_threads=4,
+    joint_prior_ba=False,
 ):
-    """Alternate soft full-pose refinement and COLMAP structure/intrinsics BA.
-
-    Pixel reprojection, center and SO(3) prior residuals share a soft-L1 loss.
-    The point step holds every camera pose fixed: it cannot normalize away scale.
-    This is block-coordinate optimization, not a joint COLMAP SE(3)-prior BA.
-    """
+    """Refine metric structure and poses with soft center and orientation priors."""
     if iterations < 1:
         raise ValueError("prior refinement iterations must be positive")
     frame_action, scale = _prepare_prior_frame(model, priors)
     rotation_sigma = np.deg2rad(priors.rotation_sigma_deg)
+    images = [im for im in model.images.values() if im.has_pose]
+    joint = False
+    if joint_prior_ba and images and model.num_points3D():
+        if not fix_intrinsics or any(
+            im.name not in priors.poses
+            or model.cameras[im.camera_id].model.name != "PINHOLE"
+            or len(model.frames[im.frame_id].data_ids) != 1
+            for im in images
+        ):
+            raise ValueError(
+                "Joint prior BA requires calibrated single-camera frames and complete pose priors"
+            )
+        from .metric_ba import adjust
+
+        joint = adjust(model, images, priors, rotation_sigma, pixel_sigma, iterations)
+    if not joint:
+        _alternate_refinement(
+            model,
+            priors,
+            rotation_sigma,
+            iterations,
+            fix_intrinsics,
+            pixel_sigma,
+            num_threads,
+        )
+    # Pose updates can invalidate the parallax as well as the reprojection test.
+    before_points = model.num_points3D()
+    min_angle = pycolmap.IncrementalMapperOptions().filter_min_tri_angle
+    rejected = pycolmap.ObservationManager(model).filter_all_points3D(
+        4 * pixel_sigma, min_angle
+    )
+    if model.num_points3D() == 0:
+        raise ValueError(
+            "Pose-prior refinement left no valid points; check prior conventions and weights"
+        )
+    model.update_point_3d_errors()
+    return {
+        "prior_frame_action": frame_action,
+        "solver": "joint_metric" if joint else "alternating",
+        "alignment_scale": scale,
+        "iterations": iterations,
+        "observations_rejected_after_refinement": rejected,
+        "min_triangulation_angle_deg": min_angle,
+        "points_removed_after_refinement": before_points - model.num_points3D(),
+        "position_sigma_m": priors.position_sigma,
+        "rotation_sigma_deg": priors.rotation_sigma_deg,
+    }
+
+
+def _alternate_refinement(
+    model, priors, rotation_sigma, iterations, fix_intrinsics, pixel_sigma, num_threads
+):
     for _ in range(iterations):
         for image in model.images.values():
             if not image.has_pose or image.name not in priors.poses:
@@ -232,42 +291,3 @@ def refine_with_pose_priors(
         ba.solver_options.max_num_iterations = 30
         ba.print_summary = False
         pycolmap.bundle_adjustment(model, ba)
-    # Pose changes can invalidate observations retained by the original mapper.
-    bad = []
-    for image in model.images.values():
-        if not image.has_pose:
-            continue
-        observed = [(i, p) for i, p in enumerate(image.points2D) if p.has_point3D()]
-        if not observed:
-            continue
-        xyz = np.stack([model.points3D[p.point3D_id].xyz for _, p in observed])
-        camera_xyz = (
-            xyz @ image.cam_from_world().rotation.matrix().T
-            + image.cam_from_world().translation
-        )
-        projected = model.cameras[image.camera_id].img_from_cam(camera_xyz)
-        xy = np.stack([p.xy for _, p in observed])
-        invalid = (
-            (camera_xyz[:, 2] <= 0)
-            | ~np.isfinite(projected).all(axis=1)
-            | (np.linalg.norm(projected - xy, axis=1) > 4 * pixel_sigma)
-        )
-        bad.extend((image.image_id, observed[j][0]) for j in np.flatnonzero(invalid))
-    before_points = model.num_points3D()
-    for image_id, index in bad:
-        if model.images[image_id].points2D[index].has_point3D():
-            model.delete_observation(image_id, index)
-    if model.num_points3D() == 0:
-        raise ValueError(
-            "Pose-prior refinement left no valid points; check prior conventions and weights"
-        )
-    model.update_point_3d_errors()
-    return {
-        "prior_frame_action": frame_action,
-        "alignment_scale": scale,
-        "iterations": iterations,
-        "observations_rejected_after_refinement": len(bad),
-        "points_removed_after_refinement": before_points - model.num_points3D(),
-        "position_sigma_m": priors.position_sigma,
-        "rotation_sigma_deg": priors.rotation_sigma_deg,
-    }

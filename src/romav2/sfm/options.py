@@ -17,19 +17,39 @@ class PipelineOptions:
     use_intrinsics_prior: bool = False
     use_pose_prior: bool = False
     prior_iterations: int = 3
+    joint_prior_ba: bool = False
     camera_model: str | None = None
     num_threads: int = 4
 
     fix_poses: bool = False
     init_from_poses: bool = False
+    single_camera: bool = False
+    refine_initial_pose: bool | str = False
 
     @property
     def triangulate_from_priors(self):
         return self.fix_poses or self.init_from_poses
 
     def __post_init__(self):
+        if self.joint_prior_ba and (
+            not self.use_pose_prior or not self.fix_intrinsics or self.fix_poses
+        ):
+            raise ValueError(
+                "Joint prior BA requires variable poses, pose priors and fixed calibration"
+            )
         if self.fix_poses and self.init_from_poses:
             raise ValueError("Choose either fixed poses or initialization from poses")
+        if self.refine_initial_pose not in (
+            False,
+            True,
+            "rotation",
+            "joint",
+            "landmarks",
+            "graph",
+        ):
+            raise ValueError("Unknown initial pose refinement mode")
+        if self.refine_initial_pose and not self.init_from_poses:
+            raise ValueError("Sampson refinement requires --init-from-poses")
         if self.triangulate_from_priors and not self.fix_intrinsics:
             raise ValueError(
                 "Triangulation from prior poses requires --fix-intrinsics and known calibration"

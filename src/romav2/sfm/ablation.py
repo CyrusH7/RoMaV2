@@ -247,16 +247,22 @@ def trajectory_metrics(poses, reference):
             result["sim3_scale_correction"] = float(scale)
     relative_rotation, relative_translation = [], []
     scale = result["sim3_scale_correction"]
-    for n, nxt in zip(names, names[1:]):
+    timeline = sorted(reference)
+    for n, nxt in zip(timeline, timeline[1:]):
+        if n not in poses or nxt not in poses:
+            continue
         est = np.linalg.inv(poses[n]) @ poses[nxt]
         ref = np.linalg.inv(reference[n]) @ reference[nxt]
         relative_rotation.append(
             np.rad2deg(Rotation.from_matrix(ref[:3, :3].T @ est[:3, :3]).magnitude())
         )
         relative_translation.append(np.linalg.norm(scale * est[:3, 3] - ref[:3, 3]))
-    result["adjacent_rpe_rotation_mean_deg"] = float(np.mean(relative_rotation))
-    result["adjacent_rpe_translation_sim3_mean_m"] = float(
-        np.mean(relative_translation)
+    result["adjacent_rpe_pairs"] = len(relative_rotation)
+    result["adjacent_rpe_rotation_mean_deg"] = (
+        float(np.mean(relative_rotation)) if relative_rotation else None
+    )
+    result["adjacent_rpe_translation_sim3_mean_m"] = (
+        float(np.mean(relative_translation)) if relative_translation else None
     )
     return result
 
@@ -422,6 +428,7 @@ def evaluate(args):
         "raw_ate_rmse_m",
         "sim3_rotation_mean_deg",
         "sim3_scale_correction",
+        "adjacent_rpe_pairs",
         "adjacent_rpe_rotation_mean_deg",
         "adjacent_rpe_translation_sim3_mean_m",
     ]

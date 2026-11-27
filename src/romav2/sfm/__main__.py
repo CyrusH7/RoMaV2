@@ -85,7 +85,25 @@ def main():
         action="store_true",
         help="Initialize calibrated cameras and triangulation from full input poses, then refine with soft priors",
     )
+    parser.add_argument(
+        "--refine-initial-pose",
+        nargs="?",
+        const="rotation",
+        default=False,
+        choices=("rotation", "joint", "landmarks", "graph"),
+        help="Refine seed orientation, relative motion, external landmarks, or all poses from the raw match graph",
+    )
+    parser.add_argument(
+        "--joint-prior-ba",
+        action="store_true",
+        help="Jointly optimize sparse points and poses with fixed PINHOLE calibration and metric pose priors",
+    )
     parser.add_argument("--prior-iterations", type=int, default=3)
+    parser.add_argument(
+        "--single-camera",
+        action="store_true",
+        help="Share one camera when estimating intrinsics for a single RGB stream",
+    )
     parser.add_argument("--camera-model", choices=["PINHOLE", "SIMPLE_RADIAL"])
     parser.add_argument("--num-threads", type=int, default=4)
     parser.add_argument(
@@ -119,6 +137,8 @@ def main():
         parser.error("Prior flags require --priors")
     if args.pose_select is not None and args.pose_select < 1:
         parser.error("--pose-select requires a positive K")
+    if args.refine_initial_pose and not args.init_from_poses:
+        parser.error("--refine-initial-pose requires --init-from-poses")
     if args.prior_iterations < 1 or args.num_threads < 1:
         parser.error("Prior iterations and thread count must be positive")
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -157,8 +177,11 @@ def main():
         use_pose_prior=args.pose_prior,
         fix_poses=args.fix_poses,
         init_from_poses=args.init_from_poses,
+        refine_initial_pose=args.refine_initial_pose,
         prior_iterations=args.prior_iterations,
+        joint_prior_ba=args.joint_prior_ba,
         camera_model=args.camera_model,
+        single_camera=args.single_camera,
         num_threads=args.num_threads,
         calibration=calibration,
         min_match_score=args.min_match_score,
