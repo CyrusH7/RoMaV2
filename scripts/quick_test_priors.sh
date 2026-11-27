@@ -52,6 +52,10 @@ for arm in "${arms[@]}"; do
   if [[ "$arm" == extrinsics || "$arm" == both ]]; then flags+=(--pose-prior); fi
   if [[ "$arm" == fixed_poses ]]; then flags+=(--intrinsics-prior --fix-intrinsics --fix-poses); fi
   if [[ "$arm" == prior_init ]]; then flags+=(--intrinsics-prior --fix-intrinsics --init-from-poses); fi
+  if [[ "$arm" == prior_init && -n "${PRIOR_INIT_REFINEMENT:-}" ]]; then
+    flags+=(--refine-initial-pose "$PRIOR_INIT_REFINEMENT")
+  fi
+  if [[ "${JOINT_PRIOR_BA:-0}" == 1 && ( "$arm" == both || "$arm" == prior_init ) ]]; then flags+=(--joint-prior-ba); fi
   echo "Running $arm; log: $RUN_DIR/$arm.log"
   if "$PYTHON_BIN" -u -m romav2.sfm --images "$RUN_DIR/images" --output "$RUN_DIR/$arm" \
     --pairs "$RUN_DIR/pairs.txt" --priors "$RUN_DIR/priors.json" \
