@@ -23,6 +23,8 @@ class PipelineOptions:
 
     fix_poses: bool = False
     init_from_poses: bool = False
+    incremental_prior: bool = False
+    registration_iterations: int = 5
     single_camera: bool = False
     refine_initial_pose: bool | str = False
 
@@ -31,6 +33,12 @@ class PipelineOptions:
         return self.fix_poses or self.init_from_poses
 
     def __post_init__(self):
+        if self.incremental_prior and not self.init_from_poses:
+            raise ValueError(
+                "Incremental prior registration requires initialization from poses"
+            )
+        if self.registration_iterations < 1:
+            raise ValueError("Registration iterations must be positive")
         if self.joint_prior_ba and (
             not self.use_pose_prior or not self.fix_intrinsics or self.fix_poses
         ):

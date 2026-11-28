@@ -167,11 +167,16 @@ def refine_with_pose_priors(
     pixel_sigma=1.0,
     num_threads=4,
     joint_prior_ba=False,
+    preserve_metric_frame=False,
 ):
     """Refine metric structure and poses with soft center and orientation priors."""
     if iterations < 1:
         raise ValueError("prior refinement iterations must be positive")
-    frame_action, scale = _prepare_prior_frame(model, priors)
+    frame_action, scale = (
+        ("preserved", 1.0)
+        if preserve_metric_frame
+        else _prepare_prior_frame(model, priors)
+    )
     rotation_sigma = np.deg2rad(priors.rotation_sigma_deg)
     images = [im for im in model.images.values() if im.has_pose]
     joint = False

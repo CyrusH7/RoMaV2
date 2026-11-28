@@ -98,6 +98,17 @@ def main():
         action="store_true",
         help="Jointly optimize sparse points and poses with fixed PINHOLE calibration and metric pose priors",
     )
+    parser.add_argument(
+        "--incremental-prior",
+        action="store_true",
+        help="Grow the map from a metric seed pair with validated pose-only BA before each registration",
+    )
+    parser.add_argument(
+        "--registration-iterations",
+        type=int,
+        default=5,
+        help="Pose-only BA evaluation budget per candidate (excluding the initial evaluation)",
+    )
     parser.add_argument("--prior-iterations", type=int, default=3)
     parser.add_argument(
         "--single-camera",
@@ -112,6 +123,12 @@ def main():
         help="Shared raw match cache; defaults to OUTPUT/match-cache",
     )
     args = parser.parse_args()
+    if args.incremental_prior:
+        if args.fix_poses:
+            parser.error("--incremental-prior is incompatible with --fix-poses")
+        args.init_from_poses = True
+    if args.registration_iterations < 1:
+        parser.error("--registration-iterations must be positive")
     if args.output.exists() and (
         not args.output.is_dir() or any(args.output.iterdir())
     ):
@@ -177,6 +194,8 @@ def main():
         use_pose_prior=args.pose_prior,
         fix_poses=args.fix_poses,
         init_from_poses=args.init_from_poses,
+        incremental_prior=args.incremental_prior,
+        registration_iterations=args.registration_iterations,
         refine_initial_pose=args.refine_initial_pose,
         prior_iterations=args.prior_iterations,
         joint_prior_ba=args.joint_prior_ba,

@@ -293,13 +293,19 @@ def reconstruct(
     fix_poses=False,
     init_from_poses=False,
     pose_select_k=None,
+    incremental_prior=False,
+    registration_iterations=5,
     single_camera=False,
     refine_initial_pose=False,
 ):
+    joint_prior_ba = joint_prior_ba or incremental_prior
+    init_from_poses = init_from_poses or incremental_prior
     use_pose_prior = use_pose_prior or fix_poses or init_from_poses
     options = PipelineOptions(
         fix_poses=fix_poses,
         init_from_poses=init_from_poses,
+        incremental_prior=incremental_prior,
+        registration_iterations=registration_iterations,
         single_camera=single_camera,
         refine_initial_pose=refine_initial_pose,
         cell_size=cell_size,
@@ -437,9 +443,9 @@ def reconstruct(
         sparse = output / "sparse"
         sparse.mkdir()
         models = None
-        if initial_priors is priors:
+        if initial_priors is priors or incremental_prior:
             with run.stage("geometric_verification"):
-                verified, pair_counts, conflicts = verify(priors)
+                verified, pair_counts, conflicts = verify(initial_priors)
         else:
             with run.stage("validate_initial_map"):
                 models, (verified, pair_counts, conflicts) = _validate_refined_map(
@@ -470,7 +476,19 @@ def reconstruct(
                 },
             )
         del verify, store
-        if models is None and options.triangulate_from_priors:
+        if incremental_prior:
+            from .incremental import incremental_from_priors
+
+            preferred = (
+                (refinement.get("selected") or {}).get("pair")
+                if options.refine_initial_pose
+                else None
+            )
+            with run.stage("incremental_prior_registration"):
+                models = incremental_from_priors(
+                    db_path, images, sparse, initial_priors, priors, options, preferred
+                )
+        elif models is None and options.triangulate_from_priors:
             with run.stage(
                 "prior_pose_triangulation"
                 if init_from_poses
@@ -510,10 +528,18 @@ def reconstruct(
                             model,
                             priors,
                             iterations=prior_iterations,
+                            preserve_metric_frame=incremental_prior,
                             joint_prior_ba=joint_prior_ba,
                             fix_intrinsics=fix_intrinsics,
                             num_threads=num_threads,
                         )
+                        if incremental_prior:
+                            components = track_component_sizes(model)
+                            refinement["registered_component_sizes"] = components
+                            if len(components) != 1:
+                                raise RuntimeError(
+                                    f"Final BA disconnected the incremental map: {components}"
+                                )
                         refinement["status"] = "refined_in_prior_frame"
                         refinement["initialization"] = (
                             "input_poses" if init_from_poses else "incremental_mapper"
@@ -530,7 +556,7 @@ def reconstruct(
                         refinement = {
                             "status": "skipped_fewer_than_three_registered_images"
                         }
-                    if init_from_poses:
+                    if init_from_poses and not incremental_prior:
                         from .registration import recover_prior_views
 
                         recovery = recover_prior_views(
